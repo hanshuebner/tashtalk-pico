@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["tashtalk-proto", "firmware"]
+default-members = ["tashtalk-proto"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/feralfirmware/tashtalk-pico"
+
+[profile.release]
+debug = 2
+lto = "fat"
+opt-level = "z"
+overflow-checks = false
+codegen-units = 1
+
+[profile.dev]
+debug = 2
+opt-level = 1
+overflow-checks = true
+codegen-units = 1
