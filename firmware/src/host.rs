@@ -410,12 +410,23 @@ pub async fn transmit_autoreply(
 }
 
 /// Write a byte slice over the CDC, splitting on the 64-byte max packet
-/// size. For payloads that are an exact multiple of 64 bytes, embassy-usb
-/// handles the zero-length-packet flush automatically when we drop below
-/// the boundary in the next call.
+/// size. Each chunk has a 100ms timeout — if the host isn't reading fast
+/// enough, we abandon the write rather than blocking the task forever.
+/// This prevents the hang where a slow/disconnected host stalls the
+/// entire host or debug task.
 async fn write_chunked(cdc: &mut Cdc, data: &[u8]) -> Result<(), EndpointError> {
     for chunk in data.chunks(64) {
-        cdc.write_packet(chunk).await?;
+        match embassy_futures::select::select(
+            cdc.write_packet(chunk),
+            Timer::after_millis(100),
+        )
+        .await
+        {
+            embassy_futures::select::Either::First(r) => r?,
+            embassy_futures::select::Either::Second(()) => {
+                return Err(EndpointError::Disabled);
+            }
+        }
     }
     Ok(())
 }

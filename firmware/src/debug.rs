@@ -126,13 +126,14 @@ async fn handle_input(
     for &b in data {
         match b {
             b'p' | b'P' => {
-                cdc.write_packet(b"\r\n[debug] firing PIO TX on GP2/GP3\r\n").await?;
+                write_chunked(cdc, b"\r\n[debug] firing PIO TX on GP2/GP3\r\n").await?;
                 let frame = debug_test_frame();
                 transmit_on_phy(lt_tx, lt_dialog_tx, lt_de, backoff, &frame).await;
-                cdc.write_packet(b"[debug] PIO TX done\r\n").await?;
+                write_chunked(cdc, b"[debug] PIO TX done\r\n").await?;
             }
             b'l' | b'L' | b'a' | b'A' => {
-                cdc.write_packet(
+                write_chunked(
+                    cdc,
                     b"\r\n[debug] l/a disabled - continuous lt_rx_task owns LtRx now\r\n",
                 )
                 .await?;
@@ -140,7 +141,7 @@ async fn handle_input(
                 let _ = (lt_rx, backoff);
             }
             b'b' | b'B' => {
-                cdc.write_packet(b"\r\n[debug] rebooting to BOOTSEL...\r\n").await?;
+                write_chunked(cdc, b"\r\n[debug] rebooting to BOOTSEL...\r\n").await?;
                 // Give the USB stack ~50 ms to flush so the host sees
                 // the message before we vanish off the bus.
                 embassy_time::Timer::after_millis(50).await;
@@ -154,10 +155,10 @@ async fn handle_input(
                 write_chunked(cdc, HELP).await?;
             }
             b'\r' => {
-                cdc.write_packet(b"\r\n").await?;
+                write_chunked(cdc, b"\r\n").await?;
             }
             _ => {
-                cdc.write_packet(core::slice::from_ref(&b)).await?;
+                write_chunked(cdc, core::slice::from_ref(&b)).await?;
             }
         }
     }
@@ -165,10 +166,21 @@ async fn handle_input(
 }
 
 /// Write `data` to the CDC, splitting on the 64-byte max-packet boundary.
-/// Required for messages longer than one packet.
+/// Each chunk has a 100ms timeout to prevent blocking when the host
+/// isn't reading.
 async fn write_chunked(cdc: &mut Cdc, data: &[u8]) -> Result<(), EndpointError> {
     for chunk in data.chunks(64) {
-        cdc.write_packet(chunk).await?;
+        match embassy_futures::select::select(
+            cdc.write_packet(chunk),
+            embassy_time::Timer::after_millis(100),
+        )
+        .await
+        {
+            embassy_futures::select::Either::First(r) => r?,
+            embassy_futures::select::Either::Second(()) => {
+                return Err(EndpointError::Disabled);
+            }
+        }
     }
     Ok(())
 }
@@ -176,7 +188,7 @@ async fn write_chunked(cdc: &mut Cdc, data: &[u8]) -> Result<(), EndpointError> 
 /// Emit one log line followed by `\r\n`.
 async fn write_log_line(cdc: &mut Cdc, line: &LogLine) -> Result<(), EndpointError> {
     write_chunked(cdc, line.as_bytes()).await?;
-    cdc.write_packet(b"\r\n").await?;
+    write_chunked(cdc, b"\r\n").await?;
     Ok(())
 }
 
