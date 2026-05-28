@@ -6,40 +6,75 @@ the RPI-RP2 mass-storage volume to appear, copies the UF2, and waits
 for the Pico to reboot into the new firmware.
 
 Falls back to picotool if the device is already in BOOTSEL mode.
+Works on both Linux and macOS.
 
 Usage: python3 tools/flash.py <uf2-file>
 """
 
 import glob
 import os
+import platform
 import shutil
 import subprocess
 import sys
-import termios
 import time
+
+IS_LINUX = platform.system() == "Linux"
+IS_MACOS = platform.system() == "Darwin"
+
+
+def find_bootsel_mount():
+    """Find RPI-RP2 mass-storage mount point."""
+    if IS_LINUX:
+        mounts = glob.glob("/media/*/RPI-RP2*")
+    elif IS_MACOS:
+        mounts = glob.glob("/Volumes/RPI-RP2*")
+    else:
+        mounts = []
+    return mounts[0] if mounts else None
 
 
 def find_debug_port():
-    """Find /dev/tashtalk-debug or fall back to ttyACM scan."""
+    """Find the TashTalk-Pico debug serial port."""
+    # Linux: udev symlink
     if os.path.exists("/dev/tashtalk-debug"):
         return "/dev/tashtalk-debug"
-    # Fallback: scan ttyACM devices
-    for acm in sorted(glob.glob("/dev/ttyACM*")):
-        base = os.path.basename(acm)
-        try:
-            product = open(f"/sys/class/tty/{base}/device/../product").read().strip()
-        except FileNotFoundError:
-            continue
-        if product == "TashTalk-Pico":
+
+    if IS_LINUX:
+        # Fallback: scan ttyACM devices by sysfs
+        for acm in sorted(glob.glob("/dev/ttyACM*")):
+            base = os.path.basename(acm)
+            try:
+                product = open(
+                    f"/sys/class/tty/{base}/device/../product"
+                ).read().strip()
+            except FileNotFoundError:
+                continue
+            if product != "TashTalk-Pico":
+                continue
             sysdev = os.path.realpath(f"/sys/class/tty/{base}/device")
             for part in sysdev.split("/"):
                 if ":1.2" in part:  # interface 2 = debug
                     return acm
+
+    elif IS_MACOS:
+        # macOS: cu.usbmodem devices, debug is typically the higher-numbered one
+        candidates = sorted(glob.glob("/dev/cu.usbmodem*"))
+        pico_ports = [p for p in candidates if "TashTalk" in p or "usbmodem" in p]
+        if len(pico_ports) >= 2:
+            return pico_ports[-1]  # last = debug (higher interface)
+        # Fallback: any usbmodem with suffix 3 (interface 2 → suffix 3)
+        for p in candidates:
+            if p.endswith("3"):
+                return p
+
     return None
 
 
 def send_bootsel(port):
     """Send 'b' on the debug port to enter BOOTSEL mode."""
+    import termios
+
     fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
     a = termios.tcgetattr(fd)
     a[0] = 0
@@ -57,19 +92,22 @@ def send_bootsel(port):
 
 
 def wait_for_mount(timeout=15):
-    """Wait for RPI-RP2 mass-storage to appear. Returns mount path or None."""
+    """Wait for RPI-RP2 mass-storage to appear."""
     for _ in range(int(timeout / 0.5)):
         time.sleep(0.5)
-        mounts = glob.glob("/media/*/RPI-RP2*")
-        if mounts:
-            return mounts[0]
+        mount = find_bootsel_mount()
+        if mount:
+            return mount
     return None
 
 
 def try_picotool(uf2):
     """Try flashing via picotool (device already in BOOTSEL)."""
+    picotool = shutil.which("picotool")
+    if not picotool:
+        return False
     r = subprocess.run(
-        ["picotool", "load", "-u", "-v", "-x", "-t", "uf2", uf2],
+        [picotool, "load", "-u", "-v", "-x", "-t", "uf2", uf2],
         capture_output=True,
         text=True,
     )
@@ -85,10 +123,10 @@ def main():
         sys.exit(f"UF2 file not found: {uf2}")
 
     # If already in BOOTSEL, just flash
-    mount = glob.glob("/media/*/RPI-RP2*")
+    mount = find_bootsel_mount()
     if mount:
-        print(f"Device already in BOOTSEL at {mount[0]}")
-        shutil.copy2(uf2, mount[0] + "/")
+        print(f"Device already in BOOTSEL at {mount}")
+        shutil.copy2(uf2, mount + "/")
         print("Flashed.")
         return
 
