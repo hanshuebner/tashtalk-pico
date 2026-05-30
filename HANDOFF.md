@@ -221,6 +221,26 @@ activity (collision) per the questions above.
 
 ---
 
+## Bus scope findings (2026-05-30, AD2 on Linux)
+
+Captured with `tools/bus_scope.py` (new, dwf SDK direct) on all six
+RS-485 transceiver signals (A, B, DI, DE, RE, RO).
+
+**Original conclusion (WRONG): the Mac ignores RTS-less directed data.**
+This was disproved by the `transmit_frame` timing fix — see below.
+
+- Our TX frames appeared clean on the scope but were actually **truncated**:
+  `transmit_frame` disabled SM0 ~20 µs after FIFO drain, but the last
+  word takes up to 139 µs to shift out of the OSR. The closing SDLC flag
+  was never fully transmitted. The Mac's SCC saw an abort, not a frame.
+- Signal integrity was fine: DI→B transitions 1:1, simultaneous (≤100 ns).
+- The original TashTalk PIC firmware (`one-chip.asm:593`) **always sends
+  RTS before directed data** and waits for CTS.
+
+**LLAP data frame ACKs are NOT a thing** — the ACK (0x82) control frame is
+only for ENQ during address acquisition. The directed dialog is exactly
+RTS → CTS → DATA, three frames, no acknowledgment (Inside AppleTalk ch.1).
+
 ## Dead ends — do NOT retry these
 
 - **Shrinking the RX ping-pong DMA buffer** (8/4 words): overran the PIO
@@ -233,15 +253,97 @@ activity (collision) per the questions above.
   busy-polling and nothing between CTS-detection and TX, the data landed
   too late for the Mac's CTS→data window and broke delivery (discovery
   stopped working). Also the busy-poll could spin if a dialog stalls.
-  **The Mac doesn't require this anyway** (RTS-less works) — so unless the
-  bus scope says otherwise, the dialog is not the fix. If it ever is
-  needed, it must be hardware-driven (pre-armed TX DMA triggered by the RX
-  task, with DE via PIO side-set) — *not* cooperative software.
+  The fix must be hardware-driven (pre-armed TX DMA triggered by CTS
+  detection, with DE via PIO side-set) — *not* cooperative software.
+- **Auto-ACK for data frames**: LLAP does not ACK data frames (only ENQ).
+  Adding auto-ACK broke session establishment. Reverted.
 
 ## Things that WORK and must be preserved
 - The **FM-0 clock-recovery decoder** (`tashtalk-proto/src/fm0.rs`).
 - **RX→host forwarding** + self-TX echo suppression + SetFeatures handling
   (`host.rs`).
 - **Continuous ring-DMA receiver** + inline auto-CTS (`lt_rx_task.rs`).
-- **RTS-less outbound** (`transmit_on_phy` in `host.rs`) — reliable,
-  just slow; the current baseline.
+
+## Hardware-driven originator dialog: implementation status
+
+Code is in place (compiled, tested, disabled pending debug):
+
+- **`dialog_tx.rs`** (new): static DMA buffer, arm/abort DMA CH1 → PIO0
+  TXF0, inline `trigger()` that asserts DE + fires PIO IRQ 4.
+- **`lt_phy.rs`**: `arm_dialog()` uses `exec_instr(wait 1 irq 4)` to gate
+  SM0 until trigger fires; `disarm_dialog()` cleans up on timeout.
+- **`host.rs`**: `transmit_directed_dialog()` orchestrates the full
+  sequence (pre-encode → CSMA → RTS → arm → wait CTS → drain → DE off).
+  Disabled with `let is_directed_data = false;` — flip to enable.
+- **`csma.rs`**: `maybe_signal_cts()` calls `dialog_tx::trigger()` inline.
+
+### Bugs fixed (2026-05-30, second session)
+
+1. **`transmit_frame` truncated the closing SDLC flag.** After the TX
+   FIFO drained, the code waited only `max(4*4, 20) = 20 µs` before
+   disabling SM0. But the last FIFO word was still being shifted out of
+   the OSR (up to 32 bits × 4.34 µs = 139 µs). The closing 0x7E flag
+   and often the CRC bytes were never transmitted — the Mac's SCC saw an
+   SDLC abort instead of a clean frame end. **Fixed**: wait
+   `(last_word_valid_bits + 2) * bit_us` so only the frame's real bits
+   are waited for, not the full padding word.
+
+2. **DMA armed before RTS — FIFO conflict.** The old dialog code armed
+   DMA (filling SM0's TX FIFO with pre-encoded data) *before* calling
+   `do_inner_tx` for the RTS. When `transmit_frame` enabled SM0 to send
+   the RTS, SM0 pulled the DMA data instead of the RTS bytes. **Fixed**:
+   send RTS first via `do_inner_tx`, then arm dialog, then arm DMA.
+
+3. **`arm_dialog()` called `sm.restart()`** which cleared the TX FIFO
+   (losing DMA data) and set OSR to all-ones (injecting 32 garbage bits).
+   Note: contrary to earlier analysis, `restart()` does NOT reset Y/X
+   (RP2040 datasheet §3.5.6.1). **Fixed**: replaced with `exec out null,
+   32` (drain residual OSR) + `exec wait 1 irq 4` (gate on CTS trigger),
+   preserving FIFO contents.
+
+4. **`disarm_dialog()` didn't clear the FIFO** on CTS timeout, leaving
+   stale DMA data that would corrupt the next `transmit_frame`. **Fixed**:
+   added `sm.restart()` in `disarm_dialog()` (safe here since we WANT to
+   flush the FIFO).
+
+5. **`trigger()` was void** — `maybe_signal_cts` always signaled
+   `CTS_RECEIVED` even if the dialog wasn't armed. **Fixed**: `trigger()`
+   returns `bool`; signal only fires on success.
+
+### Current state (end of 2026-05-30 second session)
+
+6. **Postamble added** to `BitStream::build_frame`: 13 raw `1` bits
+   (SDLC abort/idle marker) + 1 `0` bit (SendPoZ — drive low before
+   tristate). Matches the PIC reference firmware's `SendPostamble`.
+   Without it, padding zeros after the closing flag look like a new
+   frame start to the SCC, potentially causing spurious framing errors.
+
+**What works now:**
+- `transmit_frame` timing fix: waits for the valid bits of the last
+  word to shift out, not just 20 µs. All frames now have a complete
+  closing flag + postamble.
+- Direct TX (RTS-less) delivers frames to the Mac — AFP login, volume
+  mount, directory listing, and file open all work.
+- Auto-CTS/ACK responses work reliably.
+
+**What does NOT work: the Mac does not respond to our RTS with CTS.**
+Tested exhaustively: bare RTS + 10 ms listen, with full diagnostic
+logging for any CTS (type 0x85) frame — the Mac never sends one.
+Our RTS is correctly formed ([dest, src, 0x84, crc0, crc1], CRC
+verified, properly terminated with postamble). The Mac does receive
+our other frames (proven by working AFP sessions). Unknown why it
+rejects our RTS specifically.
+
+**Why RTS/CTS is required (not optional):**
+Trace analysis of a 145-second session (2234 bus events) shows an
+**82% retransmit rate** without RTS/CTS. The Mac retransmits each
+request 4-5 times at 1-2 s intervals. We respond to every request,
+but our responses collide with the Mac's next transmission (RE is
+tied to DE, so we can't detect collisions). RTS/CTS reserves the bus
+and prevents this. Direct TX works intermittently by luck — sometimes
+our response lands in a gap, sometimes it collides.
+
+**Next step: scope our RTS on the wire with the AD2** to see what the
+Mac actually receives. The AD2 is connected (DIO 0-5 = A, B, DI, DE,
+RE, RO). Compare our RTS waveform with the Mac's RTS waveform to find
+any encoding or timing difference that could cause the Mac to reject it.

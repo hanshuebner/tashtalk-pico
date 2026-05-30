@@ -131,6 +131,11 @@ pub async fn run(
                     let c1 = if len >= 4 { frame[len - 2] } else { 0xFF };
                     let c2 = if len >= 5 { frame[len - 1] } else { 0xFF };
 
+                    // Log any CTS frame seen, for diagnostics.
+                    if t == 0x85 {
+                        crate::tt_log!("LT_RX: CTS! d={:02x} s={:02x} crc_ok={}", dest, src, crc_ok);
+                    }
+
                     // If this CTS matches an RTS we just sent, wake the TX
                     // task (host-driven dance). Independent of the below.
                     maybe_signal_cts(frame);

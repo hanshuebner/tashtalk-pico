@@ -113,7 +113,15 @@ impl BitStream {
     }
 
     /// Assemble a full LocalTalk frame as a bit stream:
-    /// 3 flags + stuffed payload + 1 flag postamble.
+    /// 3 flags + stuffed payload + 1 flag + postamble.
+    ///
+    /// The postamble matches the PIC reference firmware (`SendPostamble`
+    /// in `one-chip.asm`): 13 raw `1` bits (SDLC abort marker) followed
+    /// by a `0` bit (`SendPoZ`) so the line is driven low before the
+    /// RS-485 driver is tristated. Without the abort marker, the padding
+    /// zeros that would fill the last word look like the start of a new
+    /// frame to the SCC, causing a spurious framing error that can
+    /// prevent the peer from processing the frame just received.
     pub fn build_frame(payload: &[u8]) -> Self {
         let mut s = Self::new();
         for _ in 0..3 {
@@ -123,6 +131,11 @@ impl BitStream {
             s.push_byte_stuffed(b);
         }
         s.push_byte_raw(0x7E);
+        // Postamble: 13 ones (abort) + 1 zero (SendPoZ).
+        for _ in 0..13 {
+            s.push_bit_raw(1);
+        }
+        s.push_bit_raw(0);
         // Flush any partial byte to bytes[] so as_bytes() returns the
         // complete stream. The last byte may have unused high bits.
         if s.cur_bit_pos > 0 {

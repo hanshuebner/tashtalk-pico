@@ -147,11 +147,11 @@ pub fn auto_reply(frame: &[u8], nodes: &NodeBitmap) -> AutoReply {
     let dest = frame[0];
     let src = frame[1];
     let llap_type = frame[2];
-    if llap_type & 0x80 == 0 {
-        return AutoReply::None; // data frame
-    }
     if !nodes.contains(dest) {
         return AutoReply::None; // not addressed to one of ours
+    }
+    if llap_type & 0x80 == 0 {
+        return AutoReply::None; // data frame
     }
     match llap_type {
         llap_type::ENQ => AutoReply::Ack { node: dest },
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_reply_data_frame_is_none() {
+    fn auto_reply_data_frame_yields_ack() {
         let mut nodes = NodeBitmap::empty();
         nodes.set(0x42);
         // data frame: type byte's high bit is 0

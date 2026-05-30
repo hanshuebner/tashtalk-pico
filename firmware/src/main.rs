@@ -94,6 +94,7 @@ impl core::fmt::Write for SliceWriter<'_> {
 mod bitstream;
 mod csma;
 mod debug;
+mod dialog_tx;
 mod host;
 mod lt;
 mod lt_phy;

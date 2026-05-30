@@ -25,6 +25,7 @@
 //!   jumper GP2 ↔ GP4 with a wire.
 
 use crate::bitstream::BitStream;
+use embassy_rp::pac;
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{
     Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig,
@@ -130,6 +131,7 @@ pub fn init_phy<'d>(
     rx_cfg.clock_divider = clock_divider();
     sm1.set_config(&rx_cfg);
     sm1.set_pin_dirs(Direction::In, &[&rx_pin_obj]);
+
     // CRITICAL: restart the SM after set_config so its PC jumps to the
     // RX program's wrap_target instead of staying at PC=0 (which is the
     // middle of the TX program — shared instruction memory!).
@@ -177,9 +179,77 @@ impl<'d> LtTx<'d> {
                 break;
             }
         }
+        // After the TX FIFO empties, the last word has just been auto-
+        // pulled into the OSR and is being shifted out. We must wait for
+        // the VALID bits (frame data including the closing SDLC flag) to
+        // finish, but NOT the zero-padding — those are inert and keeping
+        // DE high for them delays our ability to hear a CTS response
+        // (since RE is tied to DE).
+        let bit_us = 1_000_000 / BIT_RATE_HZ as u64;
+        let last_word_valid = if total_bits % 32 == 0 { 32 } else { total_bits % 32 };
+        // Add 2 bit-times of margin for clock accuracy + line settling.
+        embassy_time::Timer::after_micros((last_word_valid as u64 + 2) * bit_us).await;
+
+        self.sm.set_enable(false);
+    }
+
+    /// Arm SM0 for hardware-triggered dialog TX.
+    ///
+    /// SM0 must already be disabled (from the preceding `transmit_frame`
+    /// that sent the RTS). The TX FIFO should be empty; the caller arms
+    /// DMA (which fills the FIFO) after this call.
+    ///
+    /// Sequence: enable SM0 → discard residual OSR bits → gate on PIO
+    /// IRQ 4. When the RX task fires IRQ 4 (CTS detected), SM0
+    /// unblocks, auto-pulls the first DMA word from the FIFO, and
+    /// starts FM-0 encoding with zero wasted bits.
+    ///
+    /// **Why no `restart()`:** restart clears both FIFOs (losing any
+    /// DMA-prefilled data) and sets OSR to all-ones (injecting 32
+    /// garbage bits before real data). We avoid both by leaving the
+    /// FIFO untouched and draining OSR with `out null, 32`.
+    pub fn arm_dialog(&mut self) {
+        // SM0 is disabled at PC = `out x, 1` (where transmit_frame
+        // left it stalled on the empty FIFO). Enable it — the first
+        // PIO cycle stalls again on the empty FIFO, giving us time
+        // to exec the setup instructions below.
+        self.sm.set_enable(true);
+        // Discard residual OSR bits from the previous transmit_frame
+        // so the first auto-pull after IRQ 4 gets real FIFO data.
+        // PIO `out null, 32` = 0x6060.
+        unsafe { self.sm.exec_instr(0x6060) };
+        // Gate SM0 on PIO IRQ 4. SM stalls until trigger() fires
+        // the IRQ, then resumes at PC (`out x, 1`), auto-pulls the
+        // first DMA word, and starts encoding.
+        // PIO `wait 1 irq 4` = 0x20C4.
+        unsafe { self.sm.exec_instr(0x20c4) };
+    }
+
+    /// Disarm a previously armed dialog TX (e.g. on CTS timeout).
+    /// Disables SM0, clears the FIFO (DMA may have pre-filled it),
+    /// and clears the IRQ flag. Uses `restart()` to flush the FIFO;
+    /// this also resets OSR/shift counters but preserves X/Y, which
+    /// is fine — the next `transmit_frame` handles any OSR state.
+    pub fn disarm_dialog(&mut self) {
+        self.sm.set_enable(false);
+        self.sm.restart();
+        pac::PIO0.irq().write(|w| w.set_irq(1 << 4));
+    }
+
+    /// Wait for SM0's TX FIFO to drain (the DMA-fed data has been
+    /// consumed by the PIO encoder). Call after dialog TX fires.
+    pub async fn wait_tx_drain(&mut self) {
+        let mut iters = 0u32;
+        while !self.sm.tx().empty() {
+            embassy_time::Timer::after_micros(50).await;
+            iters += 1;
+            if iters > 2000 {
+                break;
+            }
+        }
+        // Wait for the last bits to shift out of the OSR onto the wire.
         let bit_us = 1_000_000 / BIT_RATE_HZ as u64;
         embassy_time::Timer::after_micros((bit_us * 4).max(20)).await;
-
         self.sm.set_enable(false);
     }
 }
