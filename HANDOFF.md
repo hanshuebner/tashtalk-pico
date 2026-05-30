@@ -32,17 +32,24 @@ not resume by writing more firmware; resume by *looking at the wire*.
 
 ---
 
-## Git state (push these to reach the Linux box)
+## Git state (both branches are pushed — clone on the Linux box)
 
-- **`tashtalk-pico`**: branch **`mac-localtalk-bringup`**, HEAD **`8512ae6`**.
-  This is the known-good, working-but-slow firmware. Commits:
+```sh
+git clone -b mac-localtalk-bringup git@code.netzhansa.com:hanshuebner/tashtalk-pico.git
+git clone -b localtalk-fixed-node  git@github.com:hanshuebner/TailTalk.git   # your fork
+```
+Keep them as siblings (`tashtalk-pico/` and `TailTalk/`).
+
+- **`tashtalk-pico`** branch **`mac-localtalk-bringup`** — working-but-slow
+  firmware. The working firmware is at `8512ae6`; this `HANDOFF.md` is a doc
+  commit on top. Key commits:
   - `ec93a72` — RX→host forwarding on TT_DATA + **FM-0 clock-recovery decoder** (the decoder rewrite is what made real-Mac frames decode at all; do not lose it).
-  - `424de4e` — continuous ring-DMA receiver + (an originator dance that was later reverted).
-  - `8512ae6` — reverted the dance → **RTS-less outbound** (current HEAD).
-- **`TailTalk`** (sibling repo, was at `../TailTalk`): branch
-  **`localtalk-fixed-node`**, commit **`762255a`** — makes `fixed_address`
-  work on LocalTalk + adds an `afp-server --node N` flag + a debug log of
-  NBP lookup tuples.
+  - `424de4e` — continuous ring-DMA receiver + (an originator dance later reverted).
+  - `8512ae6` — reverted the dance → **RTS-less outbound** (the working baseline).
+- **`TailTalk`** fork **`hanshuebner/TailTalk`** branch
+  **`localtalk-fixed-node`** (commit `762255a`) — makes `fixed_address`
+  work on LocalTalk + adds an `afp-server --node N` flag + an NBP-lookup
+  debug log. (Upstream is `FeralFirmware/TailTalk`; this is your fork.)
 
 The failed "originator dialog (Option A)" experiment was **never
 committed** — it was reverted with `git checkout`. Don't go looking for it.
