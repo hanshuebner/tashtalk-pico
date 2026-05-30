@@ -1,34 +1,42 @@
-//! Stateful FM-0 (differential Manchester) decoder.
+//! Stateful FM-0 (differential Manchester) decoder with clock recovery.
 //!
 //! Receives a stream of binary samples taken at 8× the bit rate from a
-//! LocalTalk wire. Recovers bit-cell boundaries by detecting the first
-//! transition (clock edge), then yields one [`Fm0Bit`] per bit cell —
-//! either a payload bit (after the bit-unstuffer has processed it) or an
-//! SDLC-level marker (`Flag`, `Abort`).
+//! LocalTalk wire and yields one [`Fm0Event`] per decoded byte / SDLC
+//! marker (`Flag`, `Abort`).
 //!
-//! ## Bit cell timing
+//! ## Why interval timing, not a free-running counter
 //!
-//! Each FM-0 bit cell is 8 samples long. The first sample of the cell
-//! is the state JUST AFTER the mandatory clock-edge transition. The
-//! last sample (position 7) is the state JUST BEFORE the next clock
-//! edge.
+//! FM-0 guarantees a line transition at **every** bit-cell boundary (the
+//! "clock edge"), plus an **extra** transition at mid-cell for a `0`:
 //!
-//! - **Bit value `1`**: no mid-cell transition. `sample[0] == sample[7]`.
-//! - **Bit value `0`**: mid-cell transition. `sample[0] != sample[7]`.
+//! - **Bit `1`**: one transition per cell → successive edges are one full
+//!   cell apart (~8 samples).
+//! - **Bit `0`**: two transitions per cell → a mid-cell edge then a
+//!   boundary edge, each ~half a cell apart (~4 samples).
 //!
-//! ## Sync recovery
+//! So the bit stream can be recovered purely from the *time between
+//! transitions*: a long gap is a `1`; a pair of short gaps is a `0`. The
+//! decoder re-anchors on every edge, which is essential when the source
+//! clock is **independent of our sample clock** — as it is for a real
+//! Mac. (An earlier free-running design that assumed exactly 8 samples
+//! per cell decoded the GP2→GP4 self-loopback perfectly, because there TX
+//! and RX share the RP2040 crystal, but drifted off-phase within a byte
+//! or two against a Mac's separately-clocked transmitter.)
 //!
-//! When a fresh decoder receives samples, it has no notion of where bit
-//! cells begin. It watches for the first transition between two
-//! successive samples — that transition IS the first clock edge — and
-//! takes the second of those two samples as position 0 of the first
-//! decodable cell.
+//! ## Sample-interval thresholds (8× oversampling)
 //!
-//! This sync assumes a long-enough idle period precedes the frame so
-//! that the first transition really IS the first clock edge of the
-//! preamble, not a random bit boundary mid-frame. The PIC firmware
-//! handles this by always preceding payload with three flag bytes (the
-//! preamble); we rely on the same.
+//! `interval` is the number of non-transition samples observed between
+//! two transitions. At nominal timing a half cell is 4 samples (interval
+//! 3) and a full cell is 8 samples (interval 7). We classify with wide
+//! margins so a few percent of clock offset or sampling jitter is
+//! harmless:
+//!
+//! | interval        | meaning                              |
+//! | --------------- | ------------------------------------ |
+//! | `< MIN`         | glitch / double edge → resync        |
+//! | `MIN..=SHORT`   | half cell (part of a `0`)            |
+//! | `SHORT+1..=LONG`| full cell (`1`, or boundary of a `0`)|
+//! | `> LONG`        | line went idle → resync              |
 
 use crate::bitstuff::{BitUnstuffer, UnstuffEvent};
 
@@ -42,18 +50,27 @@ pub enum Fm0Event {
     Abort,
 }
 
-/// 8× oversampled FM-0 decoder feeding through SDLC bit-unstuffing.
+/// Shortest interval we accept as a real half-cell. Anything below this
+/// is two transitions too close together — line noise or a glitch.
+const MIN_INTERVAL: u16 = 2;
+/// Largest interval still counted as a half cell. Nominal half = 3.
+const SHORT_MAX: u16 = 4;
+/// Largest interval still counted as a full cell. Nominal full = 7.
+/// Beyond this the line has gone quiet and we resync.
+const LONG_MAX: u16 = 11;
+
+/// Interval-timed FM-0 decoder feeding through SDLC bit-unstuffing.
 #[derive(Debug, Clone)]
 pub struct Fm0Decoder {
-    /// `false` until the first transition is observed.
-    synced: bool,
-    /// Last raw sample seen, while still searching for the first edge.
+    /// Last raw sample, or `None` before the very first sample.
     prev_sample: Option<u8>,
-    /// Level at position 0 of the current bit cell.
-    cell_start_level: u8,
-    /// How many samples we've consumed in the current bit cell, 0..=7.
-    /// 0 means "the next sample is position 0".
-    samples_in_cell: u8,
+    /// `true` once we've seen a transition to time intervals against.
+    seen_first_edge: bool,
+    /// Non-transition samples observed since the last transition.
+    since_edge: u16,
+    /// We saw the first half of a `0` (one short interval) and are
+    /// waiting for the second short interval that completes it.
+    half_pending: bool,
     /// SDLC bit-unstuffer / flag detector / abort detector.
     unstuffer: BitUnstuffer,
 }
@@ -61,10 +78,10 @@ pub struct Fm0Decoder {
 impl Fm0Decoder {
     pub const fn new() -> Self {
         Self {
-            synced: false,
             prev_sample: None,
-            cell_start_level: 0,
-            samples_in_cell: 0,
+            seen_first_edge: false,
+            since_edge: 0,
+            half_pending: false,
             unstuffer: BitUnstuffer::new(),
         }
     }
@@ -74,65 +91,101 @@ impl Fm0Decoder {
         *self = Self::new();
     }
 
-    /// `true` if the decoder has locked onto a bit-cell boundary.
+    /// `true` once the decoder has locked onto a transition and is
+    /// timing bit cells.
     pub fn is_synced(&self) -> bool {
-        self.synced
+        self.seen_first_edge
     }
 
-    /// Feed one binary sample. Returns an event when a complete bit
-    /// has been decoded AND the bit-unstuffer produced something
-    /// non-trivial (a byte boundary, a flag, or an abort).
+    /// Feed one binary sample. Returns an event when a complete bit has
+    /// been decoded AND the bit-unstuffer produced something non-trivial
+    /// (a byte, a flag, or an abort).
     pub fn feed_sample(&mut self, sample: u8) -> Option<Fm0Event> {
         debug_assert!(sample <= 1);
 
-        if !self.synced {
-            if let Some(prev) = self.prev_sample {
-                if sample != prev {
-                    // First clock edge. `sample` is now position 0 of
-                    // the first decodable cell.
-                    self.synced = true;
-                    self.cell_start_level = sample;
-                    self.samples_in_cell = 1;
-                    return None;
-                }
+        let prev = match self.prev_sample {
+            None => {
+                self.prev_sample = Some(sample);
+                return None;
             }
-            self.prev_sample = Some(sample);
+            Some(p) => p,
+        };
+        self.prev_sample = Some(sample);
+
+        if sample == prev {
+            // No transition this sample. Grow the interval; if it grows
+            // far past a full cell the line has gone idle (or this is a
+            // real abort) — drop sync so the next frame re-locks cleanly.
+            self.since_edge = self.since_edge.saturating_add(1);
+            if self.seen_first_edge && self.since_edge > LONG_MAX {
+                return self.resync();
+            }
             return None;
         }
 
-        if self.samples_in_cell == 0 {
-            // This sample is position 0 of a new cell (post-clock-edge).
-            self.cell_start_level = sample;
-            self.samples_in_cell = 1;
+        // A transition. Measure and reset the inter-edge interval.
+        let interval = self.since_edge;
+        self.since_edge = 0;
+
+        if !self.seen_first_edge {
+            // First edge: nothing to time against yet.
+            self.seen_first_edge = true;
+            self.half_pending = false;
             return None;
         }
 
-        self.samples_in_cell += 1;
-        if self.samples_in_cell == 8 {
-            // Just consumed position 7 — the last sample of the cell.
-            let bit = if sample == self.cell_start_level { 1 } else { 0 };
-            self.samples_in_cell = 0;
-            match self.unstuffer.feed_bit(bit) {
-                UnstuffEvent::Byte(b) => Some(Fm0Event::Byte(b)),
-                UnstuffEvent::Flag => Some(Fm0Event::Flag),
-                UnstuffEvent::Abort => {
-                    // Abort means we saw 7+ consecutive `1` bits, which
-                    // in LocalTalk only happens on a real abort *or* an
-                    // idle line. Our bit-cell phase is anchored on the
-                    // last clock edge — which during idle becomes
-                    // stale. Drop sync and search for a new edge before
-                    // resuming decode, otherwise the next frame would
-                    // be decoded at the wrong phase.
-                    self.synced = false;
-                    self.prev_sample = Some(sample);
-                    self.unstuffer.reset();
-                    Some(Fm0Event::Abort)
-                }
-                UnstuffEvent::None => None,
+        if interval < MIN_INTERVAL {
+            // Two transitions implausibly close — glitch.
+            return self.resync();
+        } else if interval <= SHORT_MAX {
+            // Half cell: half of a `0`.
+            if self.half_pending {
+                self.half_pending = false;
+                self.emit_bit(0)
+            } else {
+                self.half_pending = true;
+                None
+            }
+        } else if interval <= LONG_MAX {
+            // Full cell: a `1` (or, if we were mid-`0`, the phase has
+            // slipped — resync rather than emit a corrupt bit).
+            if self.half_pending {
+                self.resync()
+            } else {
+                self.emit_bit(1)
             }
         } else {
-            None
+            // Interval longer than a full cell: idle gap.
+            self.resync()
         }
+    }
+
+    /// Push one recovered bit through the unstuffer and map its result.
+    fn emit_bit(&mut self, bit: u8) -> Option<Fm0Event> {
+        match self.unstuffer.feed_bit(bit) {
+            UnstuffEvent::Byte(b) => Some(Fm0Event::Byte(b)),
+            UnstuffEvent::Flag => Some(Fm0Event::Flag),
+            UnstuffEvent::Abort => {
+                self.drop_sync();
+                Some(Fm0Event::Abort)
+            }
+            UnstuffEvent::None => None,
+        }
+    }
+
+    /// Drop bit-cell sync and clear the unstuffer, then report an Abort so
+    /// the frame assembler discards any partial frame. The next
+    /// transition is treated as a fresh first edge.
+    fn resync(&mut self) -> Option<Fm0Event> {
+        self.drop_sync();
+        Some(Fm0Event::Abort)
+    }
+
+    fn drop_sync(&mut self) {
+        self.seen_first_edge = false;
+        self.half_pending = false;
+        self.since_edge = 0;
+        self.unstuffer.reset();
     }
 }
 
@@ -146,86 +199,56 @@ impl Default for Fm0Decoder {
 mod tests {
     use super::*;
 
-    /// Encode a single bit as 8 FM-0 samples, given the line level
-    /// BEFORE the clock edge.
-    fn encode_bit(prev_level: u8, bit: u8) -> [u8; 8] {
-        // Clock edge: line toggles at position 0.
+    extern crate alloc;
+
+    /// Encode one bit as FM-0 samples at `half` samples per half-cell
+    /// (so a full cell is `2 * half` samples), given the line level
+    /// before the leading clock edge. Returns the samples and the level
+    /// the line ends at.
+    fn encode_bit(prev_level: u8, bit: u8, half: usize) -> (alloc::vec::Vec<u8>, u8) {
+        // Mandatory clock edge at the start of the cell.
         let post_edge = prev_level ^ 1;
-        let mut s = [post_edge; 8];
-        // If bit is 0, line toggles again at mid-cell (between positions
-        // 3 and 4). Samples 4..7 are at the new level.
-        if bit == 0 {
-            for cell in s.iter_mut().skip(4) {
-                *cell = prev_level;
-            }
+        let mut s = alloc::vec::Vec::with_capacity(2 * half);
+        if bit == 1 {
+            // No mid-cell transition: hold post_edge for the whole cell.
+            s.extend(core::iter::repeat(post_edge).take(2 * half));
+            (s, post_edge)
+        } else {
+            // Mid-cell transition back toward prev_level.
+            s.extend(core::iter::repeat(post_edge).take(half));
+            s.extend(core::iter::repeat(prev_level).take(half));
+            (s, prev_level)
         }
-        s
     }
 
-    fn encode_bits(prev_level: u8, bits: &[u8]) -> (u8, alloc::vec::Vec<u8>) {
-        // Reproduce the same toggling logic the PIO TX does.
+    /// Encode a bit sequence at `half` samples per half-cell.
+    fn encode_bits(prev_level: u8, bits: &[u8], half: usize) -> (u8, alloc::vec::Vec<u8>) {
         let mut samples = alloc::vec::Vec::new();
         let mut level = prev_level;
         for &b in bits {
-            let cell = encode_bit(level, b);
-            // The cell's last sample is the level the line ends at.
-            level = cell[7];
+            let (cell, end) = encode_bit(level, b, half);
             samples.extend_from_slice(&cell);
+            level = end;
         }
         (level, samples)
     }
 
-    extern crate alloc;
-
-    #[test]
-    fn syncs_on_first_edge() {
+    /// Feed idle padding then `samples`, returning all decoder events.
+    /// A trailing transition is appended so the final bit's closing clock
+    /// edge exists — real LocalTalk frames always have one (the postamble
+    /// / following idle), only hand-built sample vectors don't.
+    fn decode(mut samples: alloc::vec::Vec<u8>, half: usize) -> alloc::vec::Vec<Fm0Event> {
         let mut d = Fm0Decoder::new();
-        // Idle low samples — no edge.
-        for _ in 0..32 {
-            assert_eq!(d.feed_sample(0), None);
-            assert!(!d.is_synced());
-        }
-        // Now an edge: 0 → 1.
-        assert_eq!(d.feed_sample(1), None);
-        assert!(d.is_synced());
-    }
+        // Idle-low padding so the first encoded edge is the first edge.
+        let mut stream = alloc::vec::Vec::new();
+        stream.extend(core::iter::repeat(0u8).take(2 * half));
+        let last = samples.last().copied().unwrap_or(0);
+        // Trailing closing edge + a little settle.
+        samples.extend(core::iter::repeat(last ^ 1).take(2 * half));
+        stream.extend(samples);
 
-    #[test]
-    fn decodes_a_single_one_bit() {
-        let mut d = Fm0Decoder::new();
-        // Pad some idle, then transmit bit=1.
-        // For bit 1: line transitions at position 0 of the cell, stays
-        // for all 8 samples. We need a prior edge to sync. So we'll
-        // emit two adjacent cells whose first edge syncs us, and the
-        // second cell whose bit we recover is the 1.
-        let (_, mut samples) = encode_bits(0, &[1]); // first cell, bit=1
-        let (_, more) = encode_bits(samples[7], &[1]); // second cell, bit=1
-        samples.extend_from_slice(&more);
-
-        // Feed all 16 samples.
         let mut events = alloc::vec::Vec::new();
-        for s in samples {
-            if let Some(e) = d.feed_sample(s) {
-                events.push(e);
-            }
-        }
-        // The bit-unstuffer accumulates bits into bytes; 2 bits is not
-        // enough for a Byte event. But the decoder should not have
-        // emitted Flag or Abort either.
-        assert!(events.is_empty());
-    }
-
-    /// Feed `samples` into the decoder. Returns all events.
-    fn decode_with_idle_prefix(samples: alloc::vec::Vec<u8>) -> alloc::vec::Vec<Fm0Event> {
-        let mut d = Fm0Decoder::new();
-        // Prepend 16 samples of idle low so the decoder syncs on the
-        // FIRST edge of the encoded data (instead of treating the
-        // first encoded sample as post-edge, which loses cell 0).
-        let mut events = alloc::vec::Vec::new();
-        for _ in 0..16 {
-            assert_eq!(d.feed_sample(0), None);
-        }
-        for s in samples {
+        for s in stream {
             if let Some(e) = d.feed_sample(s) {
                 events.push(e);
             }
@@ -234,18 +257,22 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_byte() {
-        // Encode 8 specific data bits, LSB-first, into samples, then
-        // decode and check we recover the byte. To prevent flag/abort
-        // patterns we choose a byte that has no run of 5+ ones:
-        // 0x55 = 0b01010101.
+    fn syncs_on_first_edge() {
+        let mut d = Fm0Decoder::new();
+        for _ in 0..32 {
+            assert_eq!(d.feed_sample(0), None);
+            assert!(!d.is_synced());
+        }
+        assert_eq!(d.feed_sample(1), None);
+        assert!(d.is_synced());
+    }
+
+    #[test]
+    fn round_trip_byte_nominal() {
+        // 0x55 has no run of 5+ ones, so it can't be confused with a flag.
         let bits: alloc::vec::Vec<u8> = (0..8).map(|i| (0x55 >> i) & 1).collect();
-        // After 16 idle-low samples the decoder is unsynced. The first
-        // encoded cell's transition (level 0 → 1 for bit=1, or 0 → 0
-        // for bit=0 — wait, the encoder always transitions at the
-        // start of a cell). Encode starting from level=0.
-        let (_, samples) = encode_bits(0, &bits);
-        let events = decode_with_idle_prefix(samples);
+        let (_, samples) = encode_bits(0, &bits, 4);
+        let events = decode(samples, 4);
         assert!(
             events.contains(&Fm0Event::Byte(0x55)),
             "events: {:?}",
@@ -253,13 +280,54 @@ mod tests {
         );
     }
 
-    /// Encode the SDLC flag pattern (six consecutive 1s flanked by 0s)
-    /// and check the decoder emits Flag exactly once.
+    #[test]
+    fn round_trip_byte_slow_clock() {
+        // Source clock slower than ours: 5 samples per half-cell (cell 10
+        // vs our nominal 8). The interval decoder must still recover it —
+        // this is the case the old free-running decoder failed.
+        let bits: alloc::vec::Vec<u8> = (0..8).map(|i| (0x55 >> i) & 1).collect();
+        let (_, samples) = encode_bits(0, &bits, 5);
+        let events = decode(samples, 5);
+        assert!(
+            events.contains(&Fm0Event::Byte(0x55)),
+            "events: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn round_trip_byte_fast_clock() {
+        // Source clock faster than ours: 3 samples per half-cell (cell 6).
+        let bits: alloc::vec::Vec<u8> = (0..8).map(|i| (0x55 >> i) & 1).collect();
+        let (_, samples) = encode_bits(0, &bits, 3);
+        let events = decode(samples, 3);
+        assert!(
+            events.contains(&Fm0Event::Byte(0x55)),
+            "events: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn round_trip_byte_with_zeros() {
+        // A byte containing 0 bits exercises the mid-cell-transition path.
+        let val = 0x24u8; // 0b00100100
+        let bits: alloc::vec::Vec<u8> = (0..8).map(|i| (val >> i) & 1).collect();
+        let (_, samples) = encode_bits(0, &bits, 4);
+        let events = decode(samples, 4);
+        assert!(
+            events.contains(&Fm0Event::Byte(val)),
+            "events: {:?}",
+            events
+        );
+    }
+
     #[test]
     fn detects_flag() {
+        // SDLC flag: 0 1 1 1 1 1 1 0.
         let bits = [0u8, 1, 1, 1, 1, 1, 1, 0];
-        let (_, samples) = encode_bits(0, &bits);
-        let events = decode_with_idle_prefix(samples);
+        let (_, samples) = encode_bits(0, &bits, 4);
+        let events = decode(samples, 4);
         assert!(events.contains(&Fm0Event::Flag), "events: {:?}", events);
     }
 }

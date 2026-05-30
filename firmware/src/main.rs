@@ -142,11 +142,12 @@ async fn main(spawner: Spawner) {
     static LT_RX: StaticCell<MaybeLtRx> = StaticCell::new();
     let lt_rx: &'static MaybeLtRx = LT_RX.init(Mutex::new(Some(lt_rx)));
 
-    // Shared node-ID bitmap. Hardcoded to include node 0x42 for now so
-    // the autoresponder will reply to ENQs targeting it. Host writes
-    // via the 0x02 SetNodeIds opcode will overwrite this.
-    let mut initial_nodes = NodeBitmap::empty();
-    initial_nodes.set(0x42);
+    // Shared node-ID bitmap. Empty at boot: the autoresponder defends
+    // nothing until a host claims node IDs via the 0x02 SetNodeIds
+    // opcode. (A non-empty default would make the Pico squat on a node
+    // and answer ENQs for it, corrupting a host stack's own LocalTalk
+    // address acquisition.)
+    let initial_nodes = NodeBitmap::empty();
     static NODES: StaticCell<SharedNodes> = StaticCell::new();
     let nodes: &'static SharedNodes = NODES.init(Mutex::new(initial_nodes));
 
@@ -165,17 +166,17 @@ async fn main(spawner: Spawner) {
     // Debug CDC: banner, echo, log lines, command shell.
     unwrap!(spawner.spawn(debug::run(debug_cdc, lt_tx, lt_rx, lt_de, backoff)));
 
-    // Data CDC: host command parser; also emits synthetic frames.
+    // Data CDC: host command parser + LocalTalk→host frame forwarding.
     unwrap!(spawner.spawn(host::run(data_cdc, lt_tx, lt_de, nodes, backoff)));
 
-    // Continuous LocalTalk receiver + autoresponder. Takes a DMA
-    // channel for ping-pong sample capture from PIO RX FIFO.
+    // Continuous LocalTalk receiver + autoresponder. Small ping-pong DMA
+    // buffers keep wire→CTS latency inside LLAP's response window; the
+    // autonomous ACK/CTS is transmitted inline on this task.
     unwrap!(spawner.spawn(lt_rx_task::run(
         lt_rx,
         lt_tx,
         lt_de,
         nodes,
-        backoff,
         embassy_rp::Peripheral::into_ref(p.DMA_CH0),
     )));
 }

@@ -1,32 +1,35 @@
 //! Data CDC task — TT_DATA.
 //!
-//! Wires the host byte stream into `tashtalk-proto`'s `CommandParser`,
-//! and emits periodic *synthetic* LocalTalk frames up to the host so the
-//! device→host escape encoder gets exercised even before the PIO RX path
-//! exists. Bring-up step 5 in PICO_PORT_PLAN.md.
+//! Wires the host byte stream into `tashtalk-proto`'s `CommandParser`
+//! (host → LocalTalk) and forwards every LocalTalk frame heard on the
+//! wire back up to the host (LocalTalk → host), escape-encoded exactly
+//! as the original TashTalk firmware does (`tashtalk/documentation/
+//! protocol.md`). A host AppleTalk stack such as TailTalk's `tashtalk`
+//! crate opens this port in place of `/dev/ttyUSB0`.
 //!
-//! Every 2 seconds while the host is connected, the firmware crafts a
-//! known LLAP data frame containing a literal `0x00` byte (to force the
-//! `0x00 0xFF` escape), computes the CRC, and pushes it through TT_DATA's
-//! IN endpoint terminated by `0x00 0xFD`. A host-side decoder (e.g.
-//! TailTalk's `TashTalkCodec`, or the small Python helper at
-//! `tools/synth_rx.py`) recovers the original bytes and verifies the CRC.
+//! Receive direction (the datapath this port previously lacked): the
+//! continuous `lt_rx_task` decodes frames off the wire and hands the
+//! complete frames to us over [`INBOUND_FRAMES`]; we escape-encode each
+//! one and stream it up the IN endpoint, gated on DTR so we never block
+//! on an endpoint with no reader.
 
 use crate::csma::defer_and_backoff;
 use crate::tt_log;
 use crate::usb_dev::Cdc;
 use crate::{MaybeLtTx, SharedBackoff, SharedDe, SharedNodes};
-use defmt::{info, warn};
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicU8, Ordering};
+use defmt::warn;
 use embassy_futures::select::{select, Either};
 use embassy_rp::gpio::Level;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::driver::EndpointError;
 use tashtalk_proto::codec::{
     encode_frame, CommandParser, FrameStatus, Sink, MAX_FRAME_LEN,
 };
-use tashtalk_proto::crc::lt_crc;
 use tashtalk_proto::nodemap::NodeBitmap;
 
 /// One-shot SetNodeIds events: parser pushes a new bitmap onto this
@@ -42,32 +45,120 @@ pub static SET_NODES: Channel<ThreadModeRawMutex, [u8; 32], 4> = Channel::new();
 pub static OUTBOUND_FRAMES: Channel<ThreadModeRawMutex, ([u8; 610], u16), 4> =
     Channel::new();
 
-/// Period between synthetic device→host frames.
-const SYNTHETIC_PERIOD: Duration = Duration::from_secs(2);
+/// A complete LocalTalk frame received off the wire, on its way up to
+/// the host. `lt_rx_task` produces these; `run()` escape-encodes and
+/// streams them out TT_DATA.
+pub struct InboundFrame {
+    pub buf: [u8; MAX_FRAME_LEN],
+    pub len: u16,
+    pub status: FrameStatus,
+}
 
-/// Compose the synthetic test frame.
-///
-/// LLAP layout (data frame, type byte's high bit clear):
-///   `[dest=0x42, src=0x01, type=0x01, len_hi=0x00, len_lo=0x05,`
-///   ` body=[0xDE, 0x00, 0xAD], crc1, crc2]`
-///
-/// length = 5 means "5 bytes including the 2-byte length field but
-/// excluding the 3-byte LLAP header and the 2 CRC bytes". So the body
-/// after the length field is 5-2 = 3 bytes, total wire payload 10 bytes.
-fn synthetic_frame_bytes() -> [u8; 10] {
-    let mut f = [0u8; 10];
-    f[0] = 0x42; // dest — should match a node ID in the bitmap to be "received"
-    f[1] = 0x01; // src
-    f[2] = 0x01; // LLAP type (data, low bit set, high bit clear)
-    f[3] = 0x00; // length high
-    f[4] = 0x05; // length low (body = 3, length field counts itself)
-    f[5] = 0xDE;
-    f[6] = 0x00; // ← literal 0x00 forces an escape during encoding
-    f[7] = 0xAD;
-    let crc = lt_crc(&f[..8]);
-    f[8] = crc[0];
-    f[9] = crc[1];
-    f
+/// LocalTalk → host frame queue. Depth 8 so a short burst (e.g. an
+/// NBP lookup plus a couple of replies) doesn't drop frames if the USB
+/// IN endpoint is momentarily behind.
+pub static INBOUND_FRAMES: Channel<ThreadModeRawMutex, InboundFrame, 8> = Channel::new();
+
+
+/// Active feature bits, as set by the host's `0x03 SetFeatures` command.
+/// Bit 7 = CRC calculation (we ignore it — well-behaved hosts, TailTalk
+/// included, compute the CRC themselves and hand us correct bytes).
+/// Bit 6 = CRC checking (we honour it: when set, completed frames are
+/// reported up with `0x00 0xFD` for a good CRC and `0x00 0xFC` for a bad
+/// one; when clear, every structurally-complete frame is reported `0xFD`
+/// and the host validates the CRC itself).
+pub static FEATURES: AtomicU8 = AtomicU8::new(0);
+
+/// True if the host enabled the CRC-checking feature (bit 6).
+pub fn crc_check_enabled() -> bool {
+    FEATURES.load(Ordering::Relaxed) & 0x40 != 0
+}
+
+// ── Self-transmit echo suppression ───────────────────────────────────────────
+//
+// With a half-duplex RS-422/485 transceiver (or the bring-up GP2↔GP4
+// loopback) the receiver hears everything this device transmits. The
+// original TashTalk forwards every bus frame up to the host *except the
+// ones it transmits itself*; we reproduce that by recording a short
+// signature of each transmitted frame and dropping the matching frame
+// when the continuous receiver decodes it back. Auto-replies (ACK/CTS)
+// go through the same TX choke point, so they are suppressed too.
+
+/// How long a recorded TX signature stays eligible to match an echo.
+/// One DMA buffer is ~1.1 ms; 250 ms is comfortably longer than the
+/// wire-to-decode latency while short enough that a genuine, identical
+/// frame from a peer much later is not falsely suppressed.
+const ECHO_TTL: Duration = Duration::from_millis(250);
+const ECHO_SLOTS: usize = 8;
+
+struct EchoRing {
+    /// `(signature, recorded_at)` for each live slot.
+    slots: [Option<(u32, Instant)>; ECHO_SLOTS],
+    next: usize,
+}
+
+static ECHO_RING: BlockingMutex<CriticalSectionRawMutex, RefCell<EchoRing>> =
+    BlockingMutex::new(RefCell::new(EchoRing {
+        slots: [None; ECHO_SLOTS],
+        next: 0,
+    }));
+
+/// Signature of a frame: its length plus its trailing two bytes (the
+/// CRC for a well-formed frame). Two distinct frames sharing this are
+/// almost certainly byte-identical, so suppressing on a match is safe.
+fn frame_sig(frame: &[u8]) -> u32 {
+    let len = frame.len();
+    let lo = if len >= 1 { frame[len - 1] as u32 } else { 0 };
+    let hi = if len >= 2 { frame[len - 2] as u32 } else { 0 };
+    ((len as u32 & 0xFFFF) << 16) | (hi << 8) | lo
+}
+
+/// Record that we just put `frame` on the wire, so its echo is dropped.
+pub fn record_tx(frame: &[u8]) {
+    let sig = frame_sig(frame);
+    let now = Instant::now();
+    ECHO_RING.lock(|r| {
+        let mut r = r.borrow_mut();
+        let slot = r.next;
+        r.slots[slot] = Some((sig, now));
+        r.next = (slot + 1) % ECHO_SLOTS;
+    });
+}
+
+/// If `frame` matches a still-live recorded transmission, consume that
+/// record and return true (caller should drop the frame as a self-echo).
+pub fn take_self_echo(frame: &[u8]) -> bool {
+    let sig = frame_sig(frame);
+    ECHO_RING.lock(|r| {
+        let mut r = r.borrow_mut();
+        for slot in r.slots.iter_mut() {
+            if let Some((s, when)) = *slot {
+                if when.elapsed() > ECHO_TTL {
+                    *slot = None;
+                } else if s == sig {
+                    *slot = None;
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
+/// Queue a received LocalTalk frame for delivery up TT_DATA. Non-blocking;
+/// if the host is slow and the queue is full the frame is dropped (the
+/// AppleTalk layer above tolerates loss — LocalTalk itself is lossy).
+pub fn try_forward_inbound(frame: &[u8], status: FrameStatus) {
+    let n = frame.len().min(MAX_FRAME_LEN);
+    let mut f = InboundFrame {
+        buf: [0u8; MAX_FRAME_LEN],
+        len: n as u16,
+        status,
+    };
+    f.buf[..n].copy_from_slice(&frame[..n]);
+    if INBOUND_FRAMES.try_send(f).is_err() {
+        tt_log!("LT_RX: host queue full, dropped frame");
+    }
 }
 
 #[embassy_executor::task]
@@ -84,15 +175,12 @@ pub async fn run(
 
     loop {
         cdc.wait_connection().await;
-        info!("TT_DATA: host connected");
-        tt_log!("TT_DATA: host connected");
+        info_connected();
         parser.reset();
 
-        let mut tick = Ticker::every(SYNTHETIC_PERIOD);
-        let mut frame_no: u32 = 0;
-
         loop {
-            match select(cdc.read_packet(&mut buf), tick.next()).await {
+            match select(cdc.read_packet(&mut buf), INBOUND_FRAMES.receive()).await {
+                // ── Host → LocalTalk: command bytes from the host. ──
                 Either::First(Ok(n)) => {
                     tt_log!("TT_DATA: rx {} bytes", n);
                     for &byte in &buf[..n] {
@@ -116,38 +204,29 @@ pub async fn run(
                     tt_log!("TT_DATA: read err");
                     break;
                 }
-                Either::Second(()) => {
-                    frame_no = frame_no.wrapping_add(1);
-                    let raw = synthetic_frame_bytes();
-
-                    // Ticker PIO TX is OFF for now while debugging the ENQ→ACK
-                    // autoresponder — it floods the RX with data frames every
-                    // 2s that obscure the targeted ENQ→ACK traces.
-                    let _ = (lt_tx, lt_de, backoff);
-                    if false {
-                        transmit_on_phy(lt_tx, lt_de, backoff, &raw).await;
-                    }
-
-                    // Also stream the frame up TT_DATA if a host
-                    // application has the port open (DTR asserted).
+                // ── LocalTalk → host: a frame heard on the wire. ──
+                Either::Second(inbound) => {
+                    // Only stream up if a host application has the port
+                    // open (DTR asserted); writing to an IN endpoint with
+                    // no reader would hang this task. If no reader, drop.
                     if cdc.dtr() {
-                        let encoded = encode_frame(&raw, FrameStatus::Good);
+                        let encoded =
+                            encode_frame(&inbound.buf[..inbound.len as usize], inbound.status);
                         if let Err(e) = write_chunked(&mut cdc, &encoded).await {
                             warn!("TT_DATA write failed: {}", classify(e));
-                            tt_log!("TT_DATA: synthetic tx failed");
+                            tt_log!("TT_DATA: inbound tx failed");
                             break;
                         }
-                        tt_log!(
-                            "tx frame #{}: {} raw -> {} on-wire (CDC + PIO)",
-                            frame_no,
-                            raw.len(),
-                            encoded.len()
-                        );
                     }
                 }
             }
         }
     }
+}
+
+fn info_connected() {
+    defmt::info!("TT_DATA: host connected");
+    tt_log!("TT_DATA: host connected");
 }
 
 /// Drive one frame out the LocalTalk PHY with CSMA/CA defer-and-backoff.
@@ -156,11 +235,14 @@ pub async fn run(
 /// performed here. The PIC reference firmware did it inside the IOC
 /// ISR with sub-microsecond response time; with our DMA-buffered RX
 /// path, the round-trip latency between "an RTS hits the wire" and
-/// "we have a fresh CTS on the wire" is ~2-3 ms — far past LLAP's
+/// "we have a fresh CTS on the wire" is ~1.1 ms — far past LLAP's
 /// 200 µs CTS-timeout. Until the architecture can guarantee that
 /// timing (e.g. via smaller DMA buffers or interrupt-driven decode),
-/// host-side software that needs the dance must issue the RTS and
-/// data frame as separate `0x01` commands.
+/// data frames are transmitted directly after CSMA defer; a receiving
+/// Mac accepts an unsolicited directed data frame, so broadcast NBP
+/// lookups and their directed replies (Chooser visibility) work, but a
+/// Mac that wants to send *us* a directed frame will time out waiting
+/// for our (too-late) CTS.
 pub async fn transmit_on_phy(
     lt_tx: &'static MaybeLtTx,
     lt_de: &'static SharedDe,
@@ -172,13 +254,16 @@ pub async fn transmit_on_phy(
 }
 
 /// The inner "raise DE, drive PIO, drop DE" sequence — no CSMA logic.
-/// Used by both the control-frame fast path and each step of the data
-/// frame's RTS/CTS dance.
+/// Used by both the host-frame path and the autonomous reply path. Every
+/// transmitted frame is recorded for self-echo suppression so the
+/// continuous receiver doesn't forward our own transmission back to the
+/// host.
 pub async fn do_inner_tx(
     lt_tx: &'static MaybeLtTx,
     lt_de: &'static SharedDe,
     frame: &[u8],
 ) {
+    record_tx(frame);
     let mut tx_guard = lt_tx.lock().await;
     let Some(tx) = tx_guard.as_mut() else {
         tt_log!("PHY tx skipped — LtTx not initialised");
@@ -297,6 +382,7 @@ impl Sink for LogSink {
 
     fn on_set_features(&mut self, features: u8) {
         self.flush_noops();
+        FEATURES.store(features, Ordering::Relaxed);
         let calc = if features & 0x80 != 0 { "Y" } else { "n" };
         let check = if features & 0x40 != 0 { "Y" } else { "n" };
         tt_log!(
@@ -307,11 +393,6 @@ impl Sink for LogSink {
         );
     }
 }
-
-// Touch MAX_FRAME_LEN so the import is "used" — keeps the encoder dependency
-// visible and clippy/dead-code happy if encode_frame's type bound changes.
-#[allow(dead_code)]
-const _: usize = MAX_FRAME_LEN;
 
 fn classify(e: EndpointError) -> defmt::Str {
     match e {
