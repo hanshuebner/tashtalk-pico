@@ -13,7 +13,7 @@
 //! one and stream it up the IN endpoint, gated on DTR so we never block
 //! on an endpoint with no reader.
 
-use crate::csma::{clear_pending_rts, defer_and_backoff, set_pending_rts, CTS_RECEIVED};
+use crate::csma::defer_and_backoff;
 use crate::tt_log;
 use crate::usb_dev::Cdc;
 use crate::{MaybeLtTx, SharedBackoff, SharedDe, SharedNodes};
@@ -30,7 +30,6 @@ use embassy_usb::driver::EndpointError;
 use tashtalk_proto::codec::{
     encode_frame, CommandParser, FrameStatus, Sink, MAX_FRAME_LEN,
 };
-use tashtalk_proto::llap::compose_rts;
 use tashtalk_proto::nodemap::NodeBitmap;
 
 /// One-shot SetNodeIds events: parser pushes a new bitmap onto this
@@ -230,68 +229,30 @@ fn info_connected() {
     tt_log!("TT_DATA: host connected");
 }
 
-/// Number of RTS attempts before giving up and sending unsolicited.
-const RTS_ATTEMPTS: u8 = 8;
-/// How long to wait for the addressed node's CTS after sending our RTS.
-/// The peer answers within LLAP's inter-dialog gap (~200 µs); the rest
-/// is our (now sub-100 µs, ring-DMA) receive + decode latency plus slack.
-const CTS_TIMEOUT: Duration = Duration::from_micros(800);
-
-/// Drive one host-originated frame out the LocalTalk PHY.
+/// Drive one host-originated frame out the LocalTalk PHY after a CSMA
+/// defer.
 ///
-/// For a **directed data frame** this performs LLAP's originator RTS/CTS
-/// dialog: CSMA-defer, send an RTS to the destination, wait for its CTS,
-/// then send the data. A receiving Mac drops directed data it did not
-/// grant a CTS for, so without the dance it retransmits its request on a
-/// multi-second timeout — which is what made directory browsing crawl.
-/// The dialog is only viable because the continuous ring-DMA receiver
-/// (`lt_rx_task`) decodes the CTS within LLAP's window; the RX path
-/// matches it via [`crate::csma::maybe_signal_cts`] and fires
-/// [`CTS_RECEIVED`].
+/// Directed data frames are sent **unsolicited** — i.e. without the LLAP
+/// originator RTS/CTS dialog. A Mac accepts an unsolicited directed data
+/// frame, and doing so is *more* reliable here than the dance was: the
+/// dance requires our data to follow the peer's CTS within LLAP's ~200 µs
+/// inter-dialog gap, which our cooperative scheduler can't guarantee, so
+/// the data occasionally landed too late and the Mac dropped it (and then
+/// retransmitted its request on a ~1-2 s ATP timer — the cause of slow
+/// browsing). Sending directly avoids that hard real-time constraint.
 ///
-/// Broadcast and control frames (ENQ/ACK, and the autonomous ACK/CTS via
-/// [`transmit_autoreply`]) skip the dance and go straight out.
+/// The continuous ring-DMA receiver (`lt_rx_task`) keeps our *inbound*
+/// CTS turnaround inside LLAP's window, so the Mac→us direction is fast;
+/// this side just needs to be reliable. The originator RTS/CTS scaffolding
+/// in `csma.rs` remains for a future PIO-driven dialog that could meet the
+/// timing without scheduler jitter.
 pub async fn transmit_on_phy(
     lt_tx: &'static MaybeLtTx,
     lt_de: &'static SharedDe,
     backoff: &'static SharedBackoff,
     frame: &[u8],
 ) {
-    let directed_data = frame.len() >= 3 && frame[2] & 0x80 == 0 && frame[0] != 0xFF;
-    if !directed_data {
-        defer_and_backoff(backoff).await;
-        do_inner_tx(lt_tx, lt_de, frame).await;
-        return;
-    }
-
-    let dest = frame[0];
-    let our_src = frame[1];
-    for _ in 0..RTS_ATTEMPTS {
-        defer_and_backoff(backoff).await;
-        // Arm the expected pairing *before* the RTS so a very fast
-        // responder can't beat us to the signal.
-        set_pending_rts(our_src, dest);
-        let rts = compose_rts(dest, our_src);
-        do_inner_tx(lt_tx, lt_de, &rts).await;
-
-        match select(CTS_RECEIVED.wait(), Timer::after(CTS_TIMEOUT)).await {
-            Either::First(()) => {
-                // CTS granted — send the data immediately (no re-defer;
-                // we already own the dialog).
-                do_inner_tx(lt_tx, lt_de, frame).await;
-                clear_pending_rts();
-                return;
-            }
-            Either::Second(()) => {
-                clear_pending_rts();
-                // No CTS in time — back off and retry the RTS.
-            }
-        }
-    }
-
-    // Exhausted RTS attempts: fall back to an unsolicited send so we're
-    // never worse than the pre-dance behaviour.
-    tt_log!("HOST: no CTS from {:02x}; sending unsolicited", dest);
+    defer_and_backoff(backoff).await;
     do_inner_tx(lt_tx, lt_de, frame).await;
 }
 
