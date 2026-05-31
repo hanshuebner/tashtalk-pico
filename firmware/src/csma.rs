@@ -83,7 +83,9 @@ pub fn maybe_signal_cts(frame: &[u8]) {
         return;
     }
     if cts_matches_pending(frame, our_src, their_dest) {
-        if crate::dialog_tx::trigger() {
+        let armed = crate::dialog_tx::trigger();
+        crate::tt_log!("CTS match! armed={}", armed);
+        if armed {
             clear_pending_rts();
             CTS_RECEIVED.signal(());
         }

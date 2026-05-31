@@ -210,6 +210,8 @@ pub async fn run(
                     // and transmit them over the LocalTalk PHY.
                     while let Ok((frame_buf, frame_len)) = OUTBOUND_FRAMES.try_receive() {
                         let frame = &frame_buf[..frame_len as usize];
+                        tt_log!("TX {} bytes d={:02x} s={:02x} t={:02x}",
+                                frame.len(), frame[0], frame[1], frame[2]);
                         transmit_on_phy(lt_tx, lt_dialog_tx, lt_de, backoff, frame).await;
                     }
                 }
@@ -255,10 +257,14 @@ pub async fn transmit_on_phy(
     backoff: &'static SharedBackoff,
     frame: &[u8],
 ) {
-    // Directed data frames (type < 0x80, dest != 0xFF) use the RTS/CTS
-    // dialog to reserve the bus before transmitting.
-    let is_directed_data =
-        frame.len() >= 3 && frame[2] < 0x80 && frame[0] != 0xFF;
+    // RTS/CTS dialog is for originators only. In the Mac scenario,
+    // the Mac originates (sends RTS→CTS→DATA), we respond with plain
+    // DATA after CSMA — no RTS needed. The Mac does not CTS-reply to
+    // our RTS (its SCC is in originator mode, not responder mode).
+    //
+    // For multi-Pico traffic where we originate, RTS/CTS would be
+    // needed, but the current use case is Mac↔Pico request-response.
+    let is_directed_data = false;
 
     if is_directed_data {
         if transmit_directed_dialog(lt_tx, lt_dialog_tx, lt_de, backoff, frame).await {
@@ -328,7 +334,7 @@ async fn transmit_directed_dialog(
 
     // Wait for CTS (2 ms timeout).
     match embassy_time::with_timeout(
-        Duration::from_millis(2),
+        Duration::from_millis(20),
         CTS_RECEIVED.wait(),
     )
     .await
