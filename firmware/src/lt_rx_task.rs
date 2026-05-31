@@ -167,10 +167,7 @@ pub async fn run(
 
                     asm.ack_frame_end();
 
-                    crate::tt_log!(
-                        "LT_RX: frame #{} len={} d={:02x} s={:02x} t={:02x} crc=[{:02x} {:02x}] crc_ok={} -> {}",
-                        frames_seen, len, dest, src, t, c1, c2, crc_ok, disposition
-                    );
+                    let _ = (frames_seen, len, dest, src, t, c1, c2, crc_ok, disposition);
 
                     if let Some(rf) = reply_frame {
                         transmit_autoreply(lt_tx, lt_de, &rf).await;

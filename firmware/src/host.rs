@@ -198,7 +198,6 @@ pub async fn run(
             match select(cdc.read_packet(&mut buf), INBOUND_FRAMES.receive()).await {
                 // ── Host → LocalTalk: command bytes from the host. ──
                 Either::First(Ok(n)) => {
-                    tt_log!("TT_DATA: rx {} bytes", n);
                     for &byte in &buf[..n] {
                         parser.push(byte, &mut sink);
                     }
@@ -211,7 +210,6 @@ pub async fn run(
                     // and transmit them over the LocalTalk PHY.
                     while let Ok((frame_buf, frame_len)) = OUTBOUND_FRAMES.try_receive() {
                         let frame = &frame_buf[..frame_len as usize];
-                        tt_log!("HOST: PIO TX {} bytes", frame.len());
                         transmit_on_phy(lt_tx, lt_dialog_tx, lt_de, backoff, frame).await;
                     }
                 }
@@ -471,10 +469,7 @@ impl Default for LogSink {
 
 impl LogSink {
     fn flush_noops(&mut self) {
-        if self.noop_run > 0 {
-            tt_log!("HOST: {} noop bytes", self.noop_run);
-            self.noop_run = 0;
-        }
+        self.noop_run = 0;
     }
 }
 
@@ -488,13 +483,7 @@ impl Sink for LogSink {
         self.frame_bytes_seen = 0;
         self.current_frame_len = 0;
         let kind = if llap_type & 0x80 != 0 { "ctrl" } else { "data" };
-        tt_log!(
-            "HOST: tx frame [{}] dest={:02x} src={:02x} type={:02x}",
-            kind,
-            dest,
-            src,
-            llap_type
-        );
+        let _ = (kind, dest, src, llap_type);
     }
 
     fn on_frame_byte(&mut self, byte: u8) {
@@ -506,10 +495,7 @@ impl Sink for LogSink {
     }
 
     fn on_frame_end(&mut self) {
-        tt_log!(
-            "HOST: tx frame end ({} bytes total)",
-            self.frame_bytes_seen
-        );
+        let _ = self.frame_bytes_seen;
         let _ = OUTBOUND_FRAMES.try_send((self.current_frame, self.current_frame_len));
         self.current_frame_len = 0;
     }
