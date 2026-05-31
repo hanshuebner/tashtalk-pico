@@ -88,6 +88,23 @@ pub async fn run(
     let mut read_idx: usize = 0;
 
     loop {
+        // After our own TX (DE was high, receiver muted), the ring
+        // buffer contains garbage from the floating RO pin. Skip it
+        // all and reset the decoder so the next real frame decodes
+        // cleanly — especially important for fast auto-replies that
+        // arrive with no CSMA gap.
+        // After our own TX (DE was high, receiver muted), fast-forward
+        // past the garbage to the DMA position where DE dropped, then
+        // reset the decoder. This preserves any peer reply already
+        // captured after our TX ended.
+        let tx_pos = crate::host::TX_DONE_DMA_POS.load(Ordering::Acquire);
+        if tx_pos != 0 {
+            crate::host::TX_DONE_DMA_POS.store(0, Ordering::Release);
+            read_idx = (tx_pos.wrapping_sub(ring_base) as usize / 4) % RING_WORDS;
+            decoder.reset();
+            asm.reset();
+        }
+
         // Where has the DMA written to? write_addr wraps inside the ring.
         let write_addr = pac::DMA.ch(ch_num as usize).write_addr().read();
         let write_idx = (write_addr.wrapping_sub(ring_base) as usize / 4) % RING_WORDS;
@@ -136,11 +153,11 @@ pub async fn run(
                     maybe_signal_cts(frame);
 
                     let nodes_snapshot = *nodes.lock().await;
-                    let reply = auto_reply(frame, &nodes_snapshot).into_frame();
 
-                    let disposition = if reply.is_some() {
-                        // We answer ENQ/RTS autonomously; don't forward it
-                        // up or a host that also replies would duplicate.
+                    // Check for auto-reply FIRST, before any other
+                    // processing that might interfere.
+                    let reply_frame = auto_reply(frame, &nodes_snapshot).into_frame();
+                    let disposition = if reply_frame.is_some() {
                         "auto"
                     } else if take_self_echo(frame) {
                         "self"
@@ -158,25 +175,11 @@ pub async fn run(
 
                     crate::tt_log!(
                         "LT_RX: frame #{} len={} d={:02x} s={:02x} t={:02x} crc=[{:02x} {:02x}] crc_ok={} -> {}",
-                        frames_seen,
-                        len,
-                        dest,
-                        src,
-                        t,
-                        c1,
-                        c2,
-                        crc_ok,
-                        disposition
+                        frames_seen, len, dest, src, t, c1, c2, crc_ok, disposition
                     );
 
-                    // Transmit the reply inline, right now. The ring DMA
-                    // keeps capturing while we drive DE, so nothing is
-                    // lost (and our own echo is muted/suppressed anyway).
-                    if let Some(reply_frame) = reply {
-                        transmit_autoreply(lt_tx, lt_de, &reply_frame).await;
-                        // Yield after auto-reply so the host task can
-                        // acquire lt_tx. Without this, an ENQ/RTS flood
-                        // from the Mac starves the host task indefinitely.
+                    if let Some(rf) = reply_frame {
+                        transmit_autoreply(lt_tx, lt_de, &rf).await;
                         embassy_futures::yield_now().await;
                     }
                 }

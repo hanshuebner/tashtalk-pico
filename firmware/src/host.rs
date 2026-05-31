@@ -18,7 +18,7 @@ use crate::tt_log;
 use crate::usb_dev::Cdc;
 use crate::{MaybeLtDialogTx, MaybeLtTx, SharedBackoff, SharedDe, SharedNodes};
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use defmt::warn;
 use embassy_futures::select::{select, Either};
 use embassy_rp::gpio::Level;
@@ -74,6 +74,20 @@ pub static FEATURES: AtomicU8 = AtomicU8::new(0);
 pub fn crc_check_enabled() -> bool {
     FEATURES.load(Ordering::Relaxed) & 0x40 != 0
 }
+
+// ── TX-complete notification for the RX decoder ─────────────────────────────
+//
+// During our own TX (DE high), the receiver is muted (RE tied to DE).
+// The ring DMA captures garbage from the floating RO pin. After DE drops
+// the FM-0 decoder is in a random state and may fail to lock onto the
+// peer's reply (especially for auto-replies that follow with no CSMA
+// delay). This flag tells the RX task to skip the garbage and reset.
+
+/// After `do_inner_tx` drops DE, stores the DMA write address at that
+/// instant. The RX task fast-forwards to this position, skipping the
+/// garbage captured while the receiver was muted, then resets the
+/// decoder. A value of 0 means "no TX pending".
+pub static TX_DONE_DMA_POS: AtomicU32 = AtomicU32::new(0);
 
 // ── Self-transmit echo suppression ───────────────────────────────────────────
 //
@@ -243,12 +257,10 @@ pub async fn transmit_on_phy(
     backoff: &'static SharedBackoff,
     frame: &[u8],
 ) {
-    // Dialog disabled: the Mac does not respond to our RTS with CTS
-    // (unknown reason — see HANDOFF.md). Sending RTS without completing
-    // the CTS handshake is worse than no RTS: the Mac enters a "dialog
-    // pending" state and discards our fallback direct TX. SM2 infra is
-    // in place and ready; flip this once the CTS issue is resolved.
-    let is_directed_data = false;
+    // Directed data frames (type < 0x80, dest != 0xFF) use the RTS/CTS
+    // dialog to reserve the bus before transmitting.
+    let is_directed_data =
+        frame.len() >= 3 && frame[2] < 0x80 && frame[0] != 0xFF;
 
     if is_directed_data {
         if transmit_directed_dialog(lt_tx, lt_dialog_tx, lt_de, backoff, frame).await {
@@ -288,16 +300,14 @@ async fn transmit_directed_dialog(
     // CSMA defer before RTS.
     defer_and_backoff(backoff).await;
 
-    // Send RTS via SM0 (normal TX path). SM0 ends disabled.
-    do_inner_tx(lt_tx, lt_de, &rts).await;
-
-    // Record DATA frame for echo suppression.
+    // Record DATA frame for echo suppression before TX.
     record_tx(frame);
 
     // Clear any stale PIO IRQ 4 from a previous dialog.
     pac::PIO0.irq().write(|w| w.set_irq(1 << 4));
 
-    // Arm SM2 for dialog TX (gated on PIO IRQ 4).
+    // Arm SM2 for dialog TX (gated on PIO IRQ 4). SM2 uses a
+    // separate FIFO from SM0, so arming before the RTS is safe.
     {
         let mut dtx_guard = lt_dialog_tx.lock().await;
         if let Some(dtx) = dtx_guard.as_mut() {
@@ -305,11 +315,18 @@ async fn transmit_directed_dialog(
         }
     }
 
-    // Arm DMA → SM2's TX FIFO. SM2 is gated on IRQ 4.
+    // Arm DMA → SM2's TX FIFO. SM2 is gated on IRQ 4, won't
+    // transmit until trigger() fires.
     dialog_tx::arm_dma();
 
-    // Set the pending-RTS match for the RX task's CTS detector.
+    // Arm the CTS detector BEFORE sending RTS so a fast responder
+    // can't beat us to the signal.
     set_pending_rts(src, dest);
+
+    // Send RTS via SM0 (normal TX path). SM0 ends disabled.
+    // SM2 is blocked on `wait 1 irq 4` with latched output 0,
+    // so the PIO output OR doesn't corrupt SM0's FM-0 signal.
+    do_inner_tx(lt_tx, lt_de, &rts).await;
 
     // Wait for CTS (2 ms timeout).
     match embassy_time::with_timeout(
@@ -375,15 +392,15 @@ pub async fn do_inner_tx(
     tx.transmit_frame(frame).await;
     Timer::after_micros(5).await;
     de.set_level(Level::Low);
+    // Record where the DMA is RIGHT NOW so the RX task can skip
+    // exactly the garbage captured while the receiver was muted.
+    let dma_pos = pac::DMA.ch(0).write_addr().read();
+    TX_DONE_DMA_POS.store(dma_pos, Ordering::Release);
 }
 
-/// Transmit an autonomous reply (ACK or CTS) bypassing the CSMA defer
-/// and backoff. The PIC firmware responds to ENQ / RTS immediately
-/// from inside the IOC ISR, with no random delay — we mirror that
-/// here. Bypassing defer is crucial: the wire is just-busy from the
-/// incoming frame, so a full IDG + random backoff would push the
-/// reply far past the originator's CTS timeout, causing cascading
-/// retries.
+/// Transmit an autonomous reply (ACK or CTS) bypassing CSMA.
+/// No delay — the originator's hardware (Mac SCC, or a peer Pico's
+/// TX_DONE_DMA_POS reset) is responsible for being ready.
 pub async fn transmit_autoreply(
     lt_tx: &'static MaybeLtTx,
     lt_de: &'static SharedDe,

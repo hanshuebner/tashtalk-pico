@@ -83,10 +83,13 @@ pub fn maybe_signal_cts(frame: &[u8]) {
         return;
     }
     if cts_matches_pending(frame, our_src, their_dest) {
-        clear_pending_rts();
         if crate::dialog_tx::trigger() {
+            clear_pending_rts();
             CTS_RECEIVED.signal(());
         }
+        // If trigger() returns false (dialog not armed yet), leave
+        // pending_rts in place — the timeout in transmit_directed_dialog
+        // will clean up. Don't consume the CTS match prematurely.
     }
 }
 

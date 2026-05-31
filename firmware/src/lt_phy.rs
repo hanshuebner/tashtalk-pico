@@ -241,12 +241,14 @@ impl<'d> LtDialogTx<'d> {
 
     /// Remove SM2 from GP2: clear output values and PINCTRL.
     fn release_pin(&mut self) {
-        // Clear both OUT and SET output values for GP2 so the PIO
-        // output OR doesn't corrupt SM0's signal.
+        // Clear SM2's output values for GP2 so the PIO output OR
+        // doesn't corrupt SM0's signal.
         unsafe { self.sm.exec_instr(0xE000) }; // set pins, 0
         unsafe { self.sm.exec_instr(0xA003) }; // mov pins, null
-        self.sm.set_pin_dirs(Direction::In, &[&self.pin]);
-        // Remove GP2 from SM2's PINCTRL entirely.
+        // Do NOT call set_pin_dirs(Direction::In) here — it uses
+        // SET PINDIRS which affects the GLOBAL PIO pin direction,
+        // not per-SM. Setting GP2 to Input would kill SM0's output.
+        // Just remove GP2 from SM2's PINCTRL.
         pac::PIO0.sm(2).pinctrl().write(|w| {
             w.set_out_base(0);
             w.set_out_count(0);

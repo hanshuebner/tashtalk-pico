@@ -162,7 +162,7 @@ async fn main(spawner: Spawner) {
 
     // ── USB ───────────────────────────────────────────────────────────
     let driver = Driver::new(p.USB, Irqs);
-    let (usb_run, data_cdc, debug_cdc) = usb_dev::build(driver);
+    let (usb_run, data_cdc, debug_cdc) = usb_dev::build(driver, p.FLASH);
 
     // USB event pump — never returns.
     unwrap!(spawner.spawn(usb_run_task(usb_run)));

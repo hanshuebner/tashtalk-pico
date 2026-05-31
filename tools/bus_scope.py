@@ -3,15 +3,27 @@
 LocalTalk bus scope using Analog Discovery 2 via the dwf SDK (Linux).
 
 Captures digital logic analyzer data from the RS-485 transceiver signals
-to diagnose why outbound frames are lost.
+to diagnose frame delivery on the LocalTalk bus.
 
-Channel mapping (directly connected to AD2 DIO pins):
-  DIO 0 = A   (RS-485 differential +)
-  DIO 1 = B   (RS-485 differential -)
-  DIO 2 = DI  (data in — Pico TX to transceiver)
-  DIO 3 = DE  (driver enable — high = we are transmitting)
-  DIO 4 = RE  (receiver enable — active low)
-  DIO 5 = RO  (receiver output — data from bus)
+## Setup
+
+Two Picos with RS-485 transceivers on a shared bus (A-A, B-B, GND-GND).
+Each Pico: GP2→DI, GP3→DE+RE (tied), GP4←RO.  Half-duplex: when DE is
+high (transmitting), RE is disabled (self-muted).
+
+Probe one transceiver's signals with the AD2:
+
+  Channel mapping (AD2 DIO pins):
+    DIO 0 = A   (RS-485 differential +)
+    DIO 1 = B   (RS-485 differential -)
+    DIO 2 = DI  (data in — Pico TX to transceiver)
+    DIO 3 = DE  (driver enable — high = we are transmitting)
+    DIO 4 = RE  (receiver enable — active low, active when DE low)
+    DIO 5 = RO  (receiver output — data from bus to Pico)
+
+Device symlinks (udev):
+    /dev/tashtalk-data   → TT_DATA port (TailTalk opens this)
+    /dev/tashtalk-debug  → TT_DEBUG port (log + shell)
 
 Default trigger: DE rising edge (our TX starts).
 
@@ -41,7 +53,7 @@ DwfStateDone = 2
 DwfStateTrig = 3  # not always used
 
 trigsrcNone = 0
-trigsrcDetectorDigitalIn = 5
+trigsrcDetectorDigitalIn = 3
 
 DwfDigitalInClockSourceInternal = 0
 DwfDigitalInSampleModeSimple = 0
@@ -147,7 +159,7 @@ def configure_digital_in(dwf, hdwf, sample_rate_hz: int, buffer_size: int,
 def capture(dwf, hdwf, buffer_size: int, timeout_s: float = 10.0):
     """Arm, wait for trigger, read samples. Returns bytes array."""
     check(dwf, "FDwfDigitalInConfigure", hdwf,
-          ctypes.c_int(0),  # reconfigure
+          ctypes.c_int(1),  # reconfigure (apply settings)
           ctypes.c_int(1))  # start
 
     # Wait for armed → done

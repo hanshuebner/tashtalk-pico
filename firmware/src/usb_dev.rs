@@ -11,7 +11,8 @@
 //! On hosts where the order is ambiguous, the iProduct/iInterface strings
 //! disambiguate.
 
-use embassy_rp::peripherals::USB;
+use embassy_rp::flash::{Blocking, Flash};
+use embassy_rp::peripherals::{FLASH, USB};
 use embassy_rp::usb::Driver;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::{Builder, Config};
@@ -29,7 +30,24 @@ pub type UsbDevice = embassy_usb::UsbDevice<'static, Driver<'static, USB>>;
 /// All long-lived buffers are kept in `'static` storage via `StaticCell`,
 /// which is the conventional embassy-usb pattern for keeping the borrow
 /// checker happy across task boundaries.
-pub fn build(driver: Driver<'static, USB>) -> (UsbDevice, Cdc, Cdc) {
+pub fn build(driver: Driver<'static, USB>, flash: FLASH) -> (UsbDevice, Cdc, Cdc) {
+    // Read the flash chip's unique ID to use as USB serial number.
+    // This gives each Pico a distinct identity for udev symlinks.
+    static SERIAL_BUF: StaticCell<[u8; 17]> = StaticCell::new();
+    let serial: &'static str = {
+        let buf = SERIAL_BUF.init([0u8; 17]);
+        let mut uid = [0u8; 8];
+        let mut fl = Flash::<_, Blocking, { 2 * 1024 * 1024 }>::new_blocking(flash);
+        let _ = fl.blocking_unique_id(&mut uid);
+        // Format as 16-char hex string.
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for (i, &b) in uid.iter().enumerate() {
+            buf[i * 2] = HEX[(b >> 4) as usize];
+            buf[i * 2 + 1] = HEX[(b & 0xF) as usize];
+        }
+        core::str::from_utf8(&buf[..16]).unwrap()
+    };
+
     // USB descriptor strings. The VID/PID pair below is pid.codes test
     // space — replace with a real assignment before shipping. The
     // interface-association descriptor (IAD) class triplet
@@ -38,7 +56,7 @@ pub fn build(driver: Driver<'static, USB>) -> (UsbDevice, Cdc, Cdc) {
     let mut config = Config::new(0x16c0, 0x27dd);
     config.manufacturer = Some("FeralFirmware");
     config.product = Some("TashTalk-Pico");
-    config.serial_number = Some("000001");
+    config.serial_number = Some(serial);
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     config.device_class = 0xEF;

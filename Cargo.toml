@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["tashtalk-proto", "firmware"]
-default-members = ["tashtalk-proto"]
+default-members = ["tashtalk-proto", "firmware"]
 
 [workspace.package]
 edition = "2021"
