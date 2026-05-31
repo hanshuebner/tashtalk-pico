@@ -1,0 +1,2 @@
+# Digilent Analog Discovery 2 (FTDI FT232H)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0403", ATTR{idProduct}=="6014", MODE="0666", TAG+="uaccess"
