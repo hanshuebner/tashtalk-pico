@@ -159,7 +159,7 @@ def configure_digital_in(dwf, hdwf, sample_rate_hz: int, buffer_size: int,
 def capture(dwf, hdwf, buffer_size: int, timeout_s: float = 10.0):
     """Arm, wait for trigger, read samples. Returns bytes array."""
     check(dwf, "FDwfDigitalInConfigure", hdwf,
-          ctypes.c_int(1),  # reconfigure (apply settings)
+          ctypes.c_int(1),  # reconfigure (force apply settings before start)
           ctypes.c_int(1))  # start
 
     # Wait for armed → done
@@ -476,7 +476,7 @@ def main() -> int:
                    help="Sample rate in MHz (default: 10)")
     p.add_argument("--duration", type=float, default=0.02,
                    help="Capture duration in seconds (default: 0.02 = 20ms)")
-    p.add_argument("--trigger", choices=["de", "ro", "a"], default="de",
+    p.add_argument("--trigger", choices=["de", "ro", "a", "di"], default="de",
                    help="Trigger channel (default: de = our TX)")
     p.add_argument("--trigger-edge", choices=["rise", "fall", "any"],
                    default="rise")
@@ -492,7 +492,7 @@ def main() -> int:
                    help="Save capture(s) to CSV (appends _N for repeats)")
     args = p.parse_args()
 
-    trigger_ch_map = {"de": 3, "ro": 5, "a": 0}
+    trigger_ch_map = {"de": 3, "ro": 5, "a": 0, "di": 2}
     edge_map = {"rise": DwfTriggerSlopeRise, "fall": DwfTriggerSlopeFall,
                 "any": DwfTriggerSlopeEither}
 
