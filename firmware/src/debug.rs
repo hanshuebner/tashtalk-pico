@@ -131,6 +131,17 @@ async fn handle_input(
                 transmit_on_phy(lt_tx, lt_dialog_tx, lt_de, backoff, &frame).await;
                 write_chunked(cdc, b"[debug] PIO TX done\r\n").await?;
             }
+            b'd' | b'D' => {
+                use crate::host::AUTOREPLY_IFG;
+                use core::sync::atomic::Ordering;
+                let was = AUTOREPLY_IFG.load(Ordering::Relaxed);
+                AUTOREPLY_IFG.store(!was, Ordering::Relaxed);
+                if was {
+                    write_chunked(cdc, b"\r\n[debug] autoreply IFG OFF\r\n").await?;
+                } else {
+                    write_chunked(cdc, b"\r\n[debug] autoreply IFG ON (200us)\r\n").await?;
+                }
+            }
             b'l' | b'L' | b'a' | b'A' => {
                 write_chunked(
                     cdc,

@@ -108,7 +108,11 @@ impl BackoffState {
         self.col_history <<= 1;
         self.def_history <<= 1;
 
-        self.local_mask = self.global_mask;
+        // Ensure at least 2 bits of randomness (0–300 µs jitter above
+        // IDG) even when the global mask is 0. Without this, all nodes
+        // on a quiet bus use the same fixed IDG delay and collide every
+        // time they transmit simultaneously.
+        self.local_mask = self.global_mask | 0x03;
         self.attempts = MAX_ATTEMPTS;
     }
 

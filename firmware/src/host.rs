@@ -398,14 +398,34 @@ pub async fn do_inner_tx(
     TX_DONE_DMA_POS.store(dma_pos, Ordering::Release);
 }
 
+/// When true, insert a 200 µs inter-frame gap before auto-replies
+/// so a peer Pico's software FM-0 decoder can resync after its own
+/// TX. Not needed for the Mac (hardware SCC). Toggle with 'd' on
+/// TT_DEBUG.
+pub static AUTOREPLY_IFG: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Transmit an autonomous reply (ACK or CTS) bypassing CSMA.
-/// No delay — the originator's hardware (Mac SCC, or a peer Pico's
-/// TX_DONE_DMA_POS reset) is responsible for being ready.
+///
+/// Non-blocking: if `lt_tx` is held (we're already transmitting),
+/// the auto-reply is dropped. The peer's dialog will timeout and
+/// retry — this is correct LLAP behavior. Blocking here would
+/// deadlock bidirectional traffic (host task holds lt_tx for its
+/// own RTS while lt_rx_task needs it for the CTS response to the
+/// peer's RTS).
 pub async fn transmit_autoreply(
     lt_tx: &'static MaybeLtTx,
     lt_de: &'static SharedDe,
     frame: &[u8],
 ) {
+    // Check DE: if already high, we're mid-TX — skip.
+    if pac::SIO.gpio_in(0).read() & (1 << 3) != 0 {
+        tt_log!("autoreply: skipped (DE busy)");
+        return;
+    }
+    if AUTOREPLY_IFG.load(Ordering::Relaxed) {
+        Timer::after_micros(200).await;
+    }
     do_inner_tx(lt_tx, lt_de, frame).await;
 }
 

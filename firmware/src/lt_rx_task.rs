@@ -93,17 +93,11 @@ pub async fn run(
         // all and reset the decoder so the next real frame decodes
         // cleanly — especially important for fast auto-replies that
         // arrive with no CSMA gap.
-        // After our own TX (DE was high, receiver muted), fast-forward
-        // past the garbage to the DMA position where DE dropped, then
-        // reset the decoder. This preserves any peer reply already
-        // captured after our TX ended.
-        let tx_pos = crate::host::TX_DONE_DMA_POS.load(Ordering::Acquire);
-        if tx_pos != 0 {
-            crate::host::TX_DONE_DMA_POS.store(0, Ordering::Release);
-            read_idx = (tx_pos.wrapping_sub(ring_base) as usize / 4) % RING_WORDS;
-            decoder.reset();
-            asm.reset();
-        }
+        // Note: TX_DONE_DMA_POS decoder reset removed. With RE tied
+        // to GND (receiver always enabled), the decoder processes our
+        // own valid FM-0 signal during TX and stays synced. With RE
+        // tied to DE (receiver muted during TX), the autoreply IFG
+        // delay provides enough quiet time for natural resync.
 
         // Where has the DMA written to? write_addr wraps inside the ring.
         let write_addr = pac::DMA.ch(ch_num as usize).write_addr().read();

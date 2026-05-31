@@ -126,16 +126,27 @@ pub async fn defer_and_backoff(backoff: &'static SharedBackoff) {
     // the required idle period. Loop because new activity may extend
     // the wait — the wire really must be quiet for the FULL required
     // window, not just any consecutive window.
+    let mut deferred = false;
     loop {
         let now = Instant::now().as_micros() as u32;
         let last = WIRE_LAST_ACTIVITY_US.load(Ordering::Relaxed);
-        // wrapping_sub correctly handles the AtomicU32 wrap for any
-        // gap < 2^31 µs ≈ 35 minutes.
         let idle_for = now.wrapping_sub(last);
         if idle_for >= required_idle_us {
+            if deferred {
+                let mut g = backoff.lock().await;
+                g.record_deferral();
+            }
             return;
         }
+        deferred = true;
         let remaining = required_idle_us - idle_for;
         Timer::after(Duration::from_micros(remaining as u64)).await;
     }
+}
+
+/// Record that a dialog failed (RTS sent, no CTS received). Grows
+/// the backoff mask so the next attempt has more randomness.
+pub async fn record_collision(backoff: &'static SharedBackoff) {
+    let mut g = backoff.lock().await;
+    g.record_collision();
 }
