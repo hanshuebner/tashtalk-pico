@@ -119,6 +119,7 @@ use static_cell::StaticCell;
 pub type SharedLtTx = Mutex<ThreadModeRawMutex, lt_phy::LtTx<'static>>;
 pub type MaybeLtTx = Mutex<ThreadModeRawMutex, Option<lt_phy::LtTx<'static>>>;
 pub type MaybeLtRx = Mutex<ThreadModeRawMutex, Option<lt_phy::LtRx<'static>>>;
+pub type MaybeLtDialogTx = Mutex<ThreadModeRawMutex, Option<lt_phy::LtDialogTx<'static>>>;
 pub type SharedDe = Mutex<ThreadModeRawMutex, Output<'static>>;
 
 bind_interrupts!(struct Irqs {
@@ -133,7 +134,7 @@ async fn main(spawner: Spawner) {
     // ── LocalTalk PHY (PIO TX + RX) ──────────────────────────────────
     // GP2 = LT_DATA TX (PIO0 SM0). GP3 = LT_DE (M0+ GPIO).
     // GP4 = LT_DATA RX (PIO0 SM1) — for self-loopback, jumper GP2 to GP4.
-    let (lt_tx, lt_rx) = lt_phy::init_phy(p.PIO0, lt_phy::PioIrqs {}, p.PIN_2, p.PIN_4);
+    let (lt_tx, lt_rx, lt_dialog_tx) = lt_phy::init_phy(p.PIO0, lt_phy::PioIrqs {}, p.PIN_2, p.PIN_4);
     let de = Output::new(p.PIN_3, Level::Low);
 
     static LT_DE: StaticCell<SharedDe> = StaticCell::new();
@@ -142,6 +143,8 @@ async fn main(spawner: Spawner) {
     let lt_tx: &'static MaybeLtTx = LT_TX.init(Mutex::new(Some(lt_tx)));
     static LT_RX: StaticCell<MaybeLtRx> = StaticCell::new();
     let lt_rx: &'static MaybeLtRx = LT_RX.init(Mutex::new(Some(lt_rx)));
+    static LT_DIALOG_TX: StaticCell<MaybeLtDialogTx> = StaticCell::new();
+    let lt_dialog_tx: &'static MaybeLtDialogTx = LT_DIALOG_TX.init(Mutex::new(Some(lt_dialog_tx)));
 
     // Shared node-ID bitmap. Empty at boot: the autoresponder defends
     // nothing until a host claims node IDs via the 0x02 SetNodeIds
@@ -165,10 +168,10 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(usb_run_task(usb_run)));
 
     // Debug CDC: banner, echo, log lines, command shell.
-    unwrap!(spawner.spawn(debug::run(debug_cdc, lt_tx, lt_rx, lt_de, backoff)));
+    unwrap!(spawner.spawn(debug::run(debug_cdc, lt_tx, lt_dialog_tx, lt_rx, lt_de, backoff)));
 
     // Data CDC: host command parser + LocalTalk→host frame forwarding.
-    unwrap!(spawner.spawn(host::run(data_cdc, lt_tx, lt_de, nodes, backoff)));
+    unwrap!(spawner.spawn(host::run(data_cdc, lt_tx, lt_dialog_tx, lt_de, nodes, backoff)));
 
     // Continuous LocalTalk receiver + autoresponder. Small ping-pong DMA
     // buffers keep wire→CTS latency inside LLAP's response window; the

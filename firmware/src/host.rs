@@ -16,7 +16,7 @@
 use crate::csma::defer_and_backoff;
 use crate::tt_log;
 use crate::usb_dev::Cdc;
-use crate::{MaybeLtTx, SharedBackoff, SharedDe, SharedNodes};
+use crate::{MaybeLtDialogTx, MaybeLtTx, SharedBackoff, SharedDe, SharedNodes};
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 use defmt::warn;
@@ -166,6 +166,7 @@ pub fn try_forward_inbound(frame: &[u8], status: FrameStatus) {
 pub async fn run(
     mut cdc: Cdc,
     lt_tx: &'static MaybeLtTx,
+    lt_dialog_tx: &'static MaybeLtDialogTx,
     lt_de: &'static SharedDe,
     nodes: &'static SharedNodes,
     backoff: &'static SharedBackoff,
@@ -197,7 +198,7 @@ pub async fn run(
                     while let Ok((frame_buf, frame_len)) = OUTBOUND_FRAMES.try_receive() {
                         let frame = &frame_buf[..frame_len as usize];
                         tt_log!("HOST: PIO TX {} bytes", frame.len());
-                        transmit_on_phy(lt_tx, lt_de, backoff, frame).await;
+                        transmit_on_phy(lt_tx, lt_dialog_tx, lt_de, backoff, frame).await;
                     }
                 }
                 Either::First(Err(e)) => {
@@ -237,17 +238,20 @@ fn info_connected() {
 /// directly (no RTS). On CTS timeout, falls back to direct TX.
 pub async fn transmit_on_phy(
     lt_tx: &'static MaybeLtTx,
+    lt_dialog_tx: &'static MaybeLtDialogTx,
     lt_de: &'static SharedDe,
     backoff: &'static SharedBackoff,
     frame: &[u8],
 ) {
-    // Directed data dialog is disabled while investigating why the Mac
-    // doesn't respond to our RTS with CTS. Direct TX with the timing
-    // fix + postamble works reliably. See HANDOFF.md.
+    // Dialog disabled: the Mac does not respond to our RTS with CTS
+    // (unknown reason — see HANDOFF.md). Sending RTS without completing
+    // the CTS handshake is worse than no RTS: the Mac enters a "dialog
+    // pending" state and discards our fallback direct TX. SM2 infra is
+    // in place and ready; flip this once the CTS issue is resolved.
     let is_directed_data = false;
 
     if is_directed_data {
-        if transmit_directed_dialog(lt_tx, lt_de, backoff, frame).await {
+        if transmit_directed_dialog(lt_tx, lt_dialog_tx, lt_de, backoff, frame).await {
             return; // dialog succeeded
         }
         // Fall back to direct TX (RTS-less) — slow but works.
@@ -258,22 +262,11 @@ pub async fn transmit_on_phy(
 }
 
 /// Hardware-driven RTS/CTS/DATA originator dialog for directed data.
-/// Single attempt — returns `true` on success, `false` on CTS timeout.
-/// Caller falls back to direct TX on failure.
-///
-/// Sequence:
-///   1. Pre-encode DATA into DMA buffer
-///   2. CSMA + send RTS via normal TX path (SM0 ends disabled)
-///   3. Arm SM0 in gated mode (wait for PIO IRQ 4)
-///   4. Arm DMA → fills TX FIFO with pre-encoded DATA
-///   5. Set pending-RTS match for the RX task's CTS detector
-///   6. Wait for CTS (RX task fires trigger → DE + IRQ 4 → SM0 encodes)
-///
-/// Crucially, DMA is armed AFTER the RTS is sent — the old code armed
-/// DMA before the RTS, and the DMA data competed with the RTS for the
-/// same PIO TX FIFO, corrupting the RTS on the wire.
+/// Uses SM2 (via `lt_dialog_tx`) for the gated data TX, keeping SM0
+/// clean for regular `transmit_frame` calls.
 async fn transmit_directed_dialog(
     lt_tx: &'static MaybeLtTx,
+    lt_dialog_tx: &'static MaybeLtDialogTx,
     lt_de: &'static SharedDe,
     backoff: &'static SharedBackoff,
     frame: &[u8],
@@ -295,41 +288,30 @@ async fn transmit_directed_dialog(
     // CSMA defer before RTS.
     defer_and_backoff(backoff).await;
 
-    tt_log!("HOST: dialog RTS d={:02x} s={:02x}", dest, src);
-
-    // Send RTS via normal TX path (DE + PIO + drain).
-    // SM0 ends disabled with an empty FIFO.
+    // Send RTS via SM0 (normal TX path). SM0 ends disabled.
     do_inner_tx(lt_tx, lt_de, &rts).await;
 
-    tt_log!("HOST: RTS sent, arming dialog");
-
-    // Record DATA frame for echo suppression. (The RTS was already
-    // recorded inside do_inner_tx.)
+    // Record DATA frame for echo suppression.
     record_tx(frame);
 
     // Clear any stale PIO IRQ 4 from a previous dialog.
     pac::PIO0.irq().write(|w| w.set_irq(1 << 4));
 
-    // Arm SM0: enable + drain residual OSR + gate on IRQ 4.
-    // Must happen BEFORE arming DMA so the FIFO is empty when
-    // arm_dialog executes `out null, 32` (clearing the OSR cleanly).
+    // Arm SM2 for dialog TX (gated on PIO IRQ 4).
     {
-        let mut tx_guard = lt_tx.lock().await;
-        if let Some(tx) = tx_guard.as_mut() {
-            tx.arm_dialog();
+        let mut dtx_guard = lt_dialog_tx.lock().await;
+        if let Some(dtx) = dtx_guard.as_mut() {
+            dtx.arm_dialog();
         }
     }
 
-    // Arm DMA → PIO0 TXF0. SM0 is gated on IRQ 4, so it won't
-    // pull from the FIFO yet — the DMA just pre-fills it.
+    // Arm DMA → SM2's TX FIFO. SM2 is gated on IRQ 4.
     dialog_tx::arm_dma();
 
-    // Set the pending-RTS match. The Mac needs ~400+ µs to process
-    // our RTS and send CTS, so there's no race: CTS can't arrive
-    // before DIALOG_ARMED is set (by arm_dma above).
+    // Set the pending-RTS match for the RX task's CTS detector.
     set_pending_rts(src, dest);
 
-    // Wait for CTS (2 ms timeout from here).
+    // Wait for CTS (2 ms timeout).
     match embassy_time::with_timeout(
         Duration::from_millis(2),
         CTS_RECEIVED.wait(),
@@ -338,18 +320,17 @@ async fn transmit_directed_dialog(
     {
         Ok(()) => {
             // CTS received → trigger() asserted DE and fired IRQ 4 →
-            // SM0 unblocked and is encoding the DMA data right now.
-            // Wait for DMA + PIO FIFO to drain.
+            // SM2 is encoding the DMA data right now.
             {
-                let mut tx_guard = lt_tx.lock().await;
-                if let Some(tx) = tx_guard.as_mut() {
+                let mut dtx_guard = lt_dialog_tx.lock().await;
+                if let Some(dtx) = dtx_guard.as_mut() {
                     let mut iters = 0u32;
                     while dialog_tx::is_dma_busy() {
                         Timer::after_micros(50).await;
                         iters += 1;
-                        if iters > 1000 { break; } // safety: 50 ms max
+                        if iters > 1000 { break; }
                     }
-                    tx.wait_tx_drain().await;
+                    dtx.wait_tx_drain().await;
                 }
             }
             dialog_tx::deassert_de();
@@ -360,13 +341,12 @@ async fn transmit_directed_dialog(
             clear_pending_rts();
             dialog_tx::abort();
             {
-                let mut tx_guard = lt_tx.lock().await;
-                if let Some(tx) = tx_guard.as_mut() {
-                    tx.disarm_dialog();
+                let mut dtx_guard = lt_dialog_tx.lock().await;
+                if let Some(dtx) = dtx_guard.as_mut() {
+                    dtx.disarm_dialog();
                 }
             }
             dialog_tx::deassert_de();
-            tt_log!("HOST: dialog CTS timeout");
             false
         }
     }

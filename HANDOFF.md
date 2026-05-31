@@ -343,7 +343,41 @@ tied to DE, so we can't detect collisions). RTS/CTS reserves the bus
 and prevents this. Direct TX works intermittently by luck — sometimes
 our response lands in a gap, sometimes it collides.
 
-**Next step: scope our RTS on the wire with the AD2** to see what the
-Mac actually receives. The AD2 is connected (DIO 0-5 = A, B, DI, DE,
-RE, RO). Compare our RTS waveform with the Mac's RTS waveform to find
-any encoding or timing difference that could cause the Mac to reject it.
+**Additional finding: sending RTS + fallback is worse than no RTS.**
+When the dialog times out and we fall back to direct TX, the Mac has
+already seen our RTS and entered "dialog pending" state. The subsequent
+direct data frame (without CTS completion) is rejected. So the dialog
+must only be enabled once the CTS issue is resolved.
+
+## SM2 dialog infrastructure (2026-05-31)
+
+Moved the dialog TX from SM0 to a dedicated SM2 to prevent exec'd
+PIO instructions (`wait 1 irq 4`) from persisting across SM0
+enable/disable cycles and causing `transmit_frame` hangs (DE stuck
+high). Root cause confirmed via trace: the stalled exec survived
+`sm.restart()` and blocked subsequent `wait_push` calls.
+
+**Key RP2040 PIO constraint discovered:** PIO output values are ORed
+across ALL state machines, regardless of output enable. SM2 must NOT
+have GP2 in its PINCTRL (OUT_COUNT/SET_COUNT) when idle — otherwise
+its latched Y register value corrupts SM0's FM-0 signal. SM2's
+PINCTRL is configured in `claim_pin()` (called by `arm_dialog`) and
+cleared in `release_pin()` (called by `disarm_dialog` / `wait_tx_drain`).
+
+**Code is ready** in `lt_phy.rs` (`LtDialogTx` struct on SM2),
+`dialog_tx.rs` (DMA targets SM2's FIFO), `host.rs` (`lt_dialog_tx`
+parameter). Disabled with `is_directed_data = false` pending CTS fix.
+
+## Next step: two-Pico RTS/CTS validation
+
+Connect two Picos via RS-485 (A-A, B-B, GND-GND). Each runs this
+firmware + TailTalk. Test:
+
+1. Pico A sends RTS to Pico B → does B auto-reply CTS?
+2. Full dialog: RTS → CTS → DATA between two Picos
+3. If this works, the firmware is correct and the Mac CTS issue is
+   Mac-specific (SCC configuration, LLAP ROM quirk, or timing).
+4. If it fails, debug with full instrumentation on both sides.
+
+The two-Pico setup also validates the SM2 dialog path (arm → trigger
+→ DMA → wait_tx_drain) without the Mac in the loop.

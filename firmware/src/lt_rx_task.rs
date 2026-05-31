@@ -131,11 +131,6 @@ pub async fn run(
                     let c1 = if len >= 4 { frame[len - 2] } else { 0xFF };
                     let c2 = if len >= 5 { frame[len - 1] } else { 0xFF };
 
-                    // Log any CTS frame seen, for diagnostics.
-                    if t == 0x85 {
-                        crate::tt_log!("LT_RX: CTS! d={:02x} s={:02x} crc_ok={}", dest, src, crc_ok);
-                    }
-
                     // If this CTS matches an RTS we just sent, wake the TX
                     // task (host-driven dance). Independent of the below.
                     maybe_signal_cts(frame);
@@ -179,6 +174,10 @@ pub async fn run(
                     // lost (and our own echo is muted/suppressed anyway).
                     if let Some(reply_frame) = reply {
                         transmit_autoreply(lt_tx, lt_de, &reply_frame).await;
+                        // Yield after auto-reply so the host task can
+                        // acquire lt_tx. Without this, an ENQ/RTS flood
+                        // from the Mac starves the host task indefinitely.
+                        embassy_futures::yield_now().await;
                     }
                 }
             }

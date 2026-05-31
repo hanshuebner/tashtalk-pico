@@ -20,8 +20,8 @@ use embassy_rp::pac::dma::vals::{DataSize, TreqSel};
 /// DMA channel used for the dialog data frame.
 const DMA_CH: usize = 1;
 
-/// DREQ for PIO0 SM0 TX FIFO: `pio_no*8 + sm = 0`.
-const PIO0_TX0_DREQ: u8 = 0;
+/// DREQ for PIO0 SM2 TX FIFO: `pio_no*8 + sm = 0*8 + 2 = 2`.
+const PIO0_TX2_DREQ: u8 = 2;
 
 /// Maximum word count for a pre-encoded frame.
 /// MAX_FRAME_LEN=605, bit-stuffed ≈ 605*10+32 = 6082 bits, /32 = 191 words.
@@ -85,11 +85,11 @@ pub fn arm_dma() {
     ch.ctrl_trig().write(|w| w.set_en(false));
 
     ch.read_addr().write_value(read_addr);
-    ch.write_addr().write_value(pac::PIO0.txf(0).as_ptr() as u32);
+    ch.write_addr().write_value(pac::PIO0.txf(2).as_ptr() as u32);
     ch.trans_count().write_value(word_count);
     core::sync::atomic::compiler_fence(Ordering::SeqCst);
     ch.ctrl_trig().write(|w| {
-        w.set_treq_sel(TreqSel(PIO0_TX0_DREQ));
+        w.set_treq_sel(TreqSel(PIO0_TX2_DREQ));
         w.set_data_size(DataSize::SIZE_WORD);
         w.set_incr_read(true);
         w.set_incr_write(false);

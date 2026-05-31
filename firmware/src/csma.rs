@@ -76,30 +76,16 @@ pub fn set_pending_rts(our_src: u8, their_dest: u8) {
 /// match is consumed but the dialog will timeout and fall back to
 /// direct TX — safe but slow for that one frame.
 pub fn maybe_signal_cts(frame: &[u8]) {
-    use tashtalk_proto::llap::{cts_matches_pending, llap_type};
+    use tashtalk_proto::llap::cts_matches_pending;
     let our_src = PENDING_RTS_OUR_SRC.load(Ordering::Relaxed);
     let their_dest = PENDING_RTS_THEIR_DEST.load(Ordering::Relaxed);
     if our_src == 0xFF {
         return;
     }
-    // Log any frame seen while an RTS is pending, for diagnostics.
-    if frame.len() >= 3 {
-        let t = frame[2];
-        if t == llap_type::CTS {
-            crate::tt_log!("CTS_CHECK: d={:02x} s={:02x} pending=({:02x},{:02x}) armed={}",
-                frame[0], frame[1], our_src, their_dest,
-                crate::dialog_tx::DIALOG_ARMED.load(Ordering::Relaxed));
-        }
-    }
     if cts_matches_pending(frame, our_src, their_dest) {
         clear_pending_rts();
-        // Hardware-trigger the pre-armed dialog TX (DE + PIO IRQ 4).
-        // This is the zero-latency path: CTS detected → data on wire.
         if crate::dialog_tx::trigger() {
             CTS_RECEIVED.signal(());
-            crate::tt_log!("CTS_MATCH: trigger fired!");
-        } else {
-            crate::tt_log!("CTS_MATCH: trigger NOT armed!");
         }
     }
 }

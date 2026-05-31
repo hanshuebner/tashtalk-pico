@@ -10,6 +10,7 @@
 //! doing" and "send characters to provoke behaviour".
 
 use crate::host::transmit_on_phy;
+use crate::MaybeLtDialogTx;
 use crate::tt_log::{LogLine, CHANNEL as LOG_CHANNEL};
 use crate::usb_dev::Cdc;
 use crate::{MaybeLtRx, MaybeLtTx, SharedBackoff, SharedDe};
@@ -73,6 +74,7 @@ fn u8_to_hex(b: u8, out: &mut [u8; 4]) -> usize {
 pub async fn run(
     mut cdc: Cdc,
     lt_tx: &'static MaybeLtTx,
+    lt_dialog_tx: &'static MaybeLtDialogTx,
     lt_rx: &'static MaybeLtRx,
     lt_de: &'static SharedDe,
     backoff: &'static SharedBackoff,
@@ -88,7 +90,7 @@ pub async fn run(
             match select(cdc.read_packet(&mut buf), LOG_CHANNEL.receive()).await {
                 Either::First(Ok(n)) => {
                     if let Err(e) =
-                        handle_input(&mut cdc, &buf[..n], lt_tx, lt_rx, lt_de, backoff).await
+                        handle_input(&mut cdc, &buf[..n], lt_tx, lt_dialog_tx, lt_rx, lt_de, backoff).await
                     {
                         warn!("TT_DEBUG echo write failed: {}", classify(e));
                         break;
@@ -116,6 +118,7 @@ async fn handle_input(
     cdc: &mut Cdc,
     data: &[u8],
     lt_tx: &'static MaybeLtTx,
+    lt_dialog_tx: &'static MaybeLtDialogTx,
     lt_rx: &'static MaybeLtRx,
     lt_de: &'static SharedDe,
     backoff: &'static SharedBackoff,
@@ -125,7 +128,7 @@ async fn handle_input(
             b'p' | b'P' => {
                 cdc.write_packet(b"\r\n[debug] firing PIO TX on GP2/GP3\r\n").await?;
                 let frame = debug_test_frame();
-                transmit_on_phy(lt_tx, lt_de, backoff, &frame).await;
+                transmit_on_phy(lt_tx, lt_dialog_tx, lt_de, backoff, &frame).await;
                 cdc.write_packet(b"[debug] PIO TX done\r\n").await?;
             }
             b'l' | b'L' | b'a' | b'A' => {

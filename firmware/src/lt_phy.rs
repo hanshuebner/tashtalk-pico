@@ -28,7 +28,7 @@ use crate::bitstream::BitStream;
 use embassy_rp::pac;
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{
-    Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig,
+    Config, Direction, FifoJoin, InterruptHandler, Pin, Pio, PioPin, ShiftConfig,
     ShiftDirection, StateMachine,
 };
 use embassy_rp::Peripheral;
@@ -51,11 +51,12 @@ pub fn init_phy<'d>(
     _irqs: PioIrqs,
     tx_pin: impl Peripheral<P = impl PioPin> + 'd,
     rx_pin: impl Peripheral<P = impl PioPin> + 'd,
-) -> (LtTx<'d>, LtRx<'d>) {
+) -> (LtTx<'d>, LtRx<'d>, LtDialogTx<'d>) {
     let Pio {
         mut common,
         mut sm0,
         mut sm1,
+        mut sm2,
         ..
     } = Pio::new(pio, PioIrqs {});
 
@@ -132,15 +133,38 @@ pub fn init_phy<'d>(
     sm1.set_config(&rx_cfg);
     sm1.set_pin_dirs(Direction::In, &[&rx_pin_obj]);
 
-    // CRITICAL: restart the SM after set_config so its PC jumps to the
-    // RX program's wrap_target instead of staying at PC=0 (which is the
-    // middle of the TX program — shared instruction memory!).
-    sm1.restart();
-    // Same precaution for SM0 — its wrap_target IS 0 so this is mostly
-    // a no-op for TX, but it's harmless and makes the intent explicit.
-    sm0.restart();
+    // ── Dialog TX (SM2) ───────────────────────────────────────────────
+    // SM2 runs the same FM-0 TX program as SM0. It is used exclusively
+    // for the hardware-triggered RTS/CTS dialog, gated on PIO IRQ 4.
+    // SM0 is never touched by exec'd instructions.
+    //
+    // CRITICAL: SM2 is configured WITHOUT output pins at init. On the
+    // RP2040, PIO output values are ORed across ALL state machines —
+    // if SM2 had GP2 as an output pin, its latched output value would
+    // corrupt SM0's FM-0 signal. The output pin is only configured
+    // in arm_dialog() and removed in disarm_dialog().
+    let mut sm2_cfg = Config::default();
+    sm2_cfg.use_program(&tx_loaded, &[]);
+    // No output pins — arm_dialog will configure PINCTRL via PAC.
+    sm2_cfg.shift_out = ShiftConfig {
+        threshold: 32,
+        direction: ShiftDirection::Right,
+        auto_fill: true,
+    };
+    sm2_cfg.fifo_join = FifoJoin::TxOnly;
+    sm2_cfg.clock_divider = clock_divider();
+    sm2.set_config(&sm2_cfg);
 
-    (LtTx { sm: sm0 }, LtRx { sm: sm1 })
+    // CRITICAL: restart all SMs after set_config so PCs jump to each
+    // program's wrap_target instead of staying at PC=0.
+    sm1.restart();
+    sm0.restart();
+    sm2.restart();
+
+    // SM2 has no output pins configured (OUT_COUNT=0, SET_COUNT=0),
+    // so it cannot contribute to the PIO output OR for GP2.
+
+    (LtTx { sm: sm0 }, LtRx { sm: sm1 }, LtDialogTx { sm: sm2, pin: tx_pin_obj })
 }
 
 // ── TX ──────────────────────────────────────────────────────────────
@@ -180,77 +204,87 @@ impl<'d> LtTx<'d> {
             }
         }
         // After the TX FIFO empties, the last word has just been auto-
-        // pulled into the OSR and is being shifted out. We must wait for
-        // the VALID bits (frame data including the closing SDLC flag) to
-        // finish, but NOT the zero-padding — those are inert and keeping
-        // DE high for them delays our ability to hear a CTS response
-        // (since RE is tied to DE).
+        // pulled into the OSR and is being shifted out. Wait for the
+        // VALID bits (frame data + closing flag + postamble) to finish.
         let bit_us = 1_000_000 / BIT_RATE_HZ as u64;
         let last_word_valid = if total_bits % 32 == 0 { 32 } else { total_bits % 32 };
-        // Add 2 bit-times of margin for clock accuracy + line settling.
         embassy_time::Timer::after_micros((last_word_valid as u64 + 2) * bit_us).await;
 
         self.sm.set_enable(false);
     }
+}
 
-    /// Arm SM0 for hardware-triggered dialog TX.
-    ///
-    /// SM0 must already be disabled (from the preceding `transmit_frame`
-    /// that sent the RTS). The TX FIFO should be empty; the caller arms
-    /// DMA (which fills the FIFO) after this call.
-    ///
-    /// Sequence: enable SM0 → discard residual OSR bits → gate on PIO
-    /// IRQ 4. When the RX task fires IRQ 4 (CTS detected), SM0
-    /// unblocks, auto-pulls the first DMA word from the FIFO, and
-    /// starts FM-0 encoding with zero wasted bits.
-    ///
-    /// **Why no `restart()`:** restart clears both FIFOs (losing any
-    /// DMA-prefilled data) and sets OSR to all-ones (injecting 32
-    /// garbage bits before real data). We avoid both by leaving the
-    /// FIFO untouched and draining OSR with `out null, 32`.
-    pub fn arm_dialog(&mut self) {
-        // SM0 is disabled at PC = `out x, 1` (where transmit_frame
-        // left it stalled on the empty FIFO). Enable it — the first
-        // PIO cycle stalls again on the empty FIFO, giving us time
-        // to exec the setup instructions below.
-        self.sm.set_enable(true);
-        // Discard residual OSR bits from the previous transmit_frame
-        // so the first auto-pull after IRQ 4 gets real FIFO data.
-        // PIO `out null, 32` = 0x6060.
-        unsafe { self.sm.exec_instr(0x6060) };
-        // Gate SM0 on PIO IRQ 4. SM stalls until trigger() fires
-        // the IRQ, then resumes at PC (`out x, 1`), auto-pulls the
-        // first DMA word, and starts encoding.
-        // PIO `wait 1 irq 4` = 0x20C4.
-        unsafe { self.sm.exec_instr(0x20c4) };
+// ── Dialog TX (SM2) ────────────────────────────────────────────────
+//
+// Dedicated state machine for the hardware-triggered RTS/CTS dialog.
+// SM2 runs the same FM-0 TX program as SM0 on the same output pin
+// (GP2), but is only enabled during the dialog window. This isolates
+// SM0 from exec'd instructions (`wait 1 irq 4`) that would otherwise
+// persist across enable/disable cycles and cause hangs.
+
+pub struct LtDialogTx<'d> {
+    sm: StateMachine<'d, PIO0, 2>,
+    pin: Pin<'d, PIO0>,
+}
+
+impl<'d> LtDialogTx<'d> {
+    /// Configure SM2's PINCTRL to drive GP2 (OUT and SET groups).
+    fn claim_pin(&mut self) {
+        pac::PIO0.sm(2).pinctrl().write(|w| {
+            w.set_out_base(2); // GP2
+            w.set_out_count(1);
+            w.set_set_base(2);
+            w.set_set_count(1);
+        });
+        self.sm.set_pin_dirs(Direction::Out, &[&self.pin]);
     }
 
-    /// Disarm a previously armed dialog TX (e.g. on CTS timeout).
-    /// Disables SM0, clears the FIFO (DMA may have pre-filled it),
-    /// and clears the IRQ flag. Uses `restart()` to flush the FIFO;
-    /// this also resets OSR/shift counters but preserves X/Y, which
-    /// is fine — the next `transmit_frame` handles any OSR state.
+    /// Remove SM2 from GP2: clear output values and PINCTRL.
+    fn release_pin(&mut self) {
+        // Clear both OUT and SET output values for GP2 so the PIO
+        // output OR doesn't corrupt SM0's signal.
+        unsafe { self.sm.exec_instr(0xE000) }; // set pins, 0
+        unsafe { self.sm.exec_instr(0xA003) }; // mov pins, null
+        self.sm.set_pin_dirs(Direction::In, &[&self.pin]);
+        // Remove GP2 from SM2's PINCTRL entirely.
+        pac::PIO0.sm(2).pinctrl().write(|w| {
+            w.set_out_base(0);
+            w.set_out_count(0);
+            w.set_set_base(0);
+            w.set_set_count(0);
+        });
+    }
+
+    /// Arm SM2 for hardware-triggered dialog TX.
+    pub fn arm_dialog(&mut self) {
+        self.claim_pin();
+        self.sm.set_enable(true);
+        // Drain residual OSR so first auto-pull gets real FIFO data.
+        unsafe { self.sm.exec_instr(0x6060) }; // out null, 32
+        // Gate on PIO IRQ 4 (CTS trigger).
+        unsafe { self.sm.exec_instr(0x20c4) }; // wait 1 irq 4
+    }
+
+    /// Disarm SM2 (e.g. on CTS timeout). SM0 is unaffected.
     pub fn disarm_dialog(&mut self) {
         self.sm.set_enable(false);
         self.sm.restart();
+        self.release_pin();
         pac::PIO0.irq().write(|w| w.set_irq(1 << 4));
     }
 
-    /// Wait for SM0's TX FIFO to drain (the DMA-fed data has been
-    /// consumed by the PIO encoder). Call after dialog TX fires.
+    /// Wait for SM2's DMA-fed TX to complete, then release GP2.
     pub async fn wait_tx_drain(&mut self) {
         let mut iters = 0u32;
         while !self.sm.tx().empty() {
             embassy_time::Timer::after_micros(50).await;
             iters += 1;
-            if iters > 2000 {
-                break;
-            }
+            if iters > 2000 { break; }
         }
-        // Wait for the last bits to shift out of the OSR onto the wire.
         let bit_us = 1_000_000 / BIT_RATE_HZ as u64;
-        embassy_time::Timer::after_micros((bit_us * 4).max(20)).await;
+        embassy_time::Timer::after_micros(bit_us * 34).await;
         self.sm.set_enable(false);
+        self.release_pin();
     }
 }
 
