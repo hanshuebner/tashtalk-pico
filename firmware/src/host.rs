@@ -3,166 +3,46 @@
 //! Wires the host byte stream into `tashtalk-proto`'s `CommandParser`
 //! (host → LocalTalk) and forwards every LocalTalk frame heard on the
 //! wire back up to the host (LocalTalk → host), escape-encoded exactly
-//! as the original TashTalk firmware does (`tashtalk/documentation/
-//! protocol.md`). A host AppleTalk stack such as TailTalk's `tashtalk`
-//! crate opens this port in place of `/dev/ttyUSB0`.
-//!
-//! Receive direction (the datapath this port previously lacked): the
-//! continuous `lt_rx_task` decodes frames off the wire and hands the
-//! complete frames to us over [`INBOUND_FRAMES`]; we escape-encode each
-//! one and stream it up the IN endpoint, gated on DTR so we never block
-//! on an endpoint with no reader.
+//! as the original TashTalk firmware does.
 
-use crate::csma::defer_and_backoff;
 use crate::tt_log;
 use crate::usb_dev::Cdc;
-use crate::{MaybeLtDialogTx, MaybeLtTx, SharedBackoff, SharedDe, SharedNodes};
-use core::cell::RefCell;
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use crate::{SharedBackoff, SharedNodes, SharedTxData, SharedTxEnable};
+use core::sync::atomic::{AtomicU8, Ordering};
 use defmt::warn;
 use embassy_futures::select::{select, Either};
-use embassy_rp::gpio::Level;
-use embassy_rp::pac;
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
-use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::Timer;
 use embassy_usb::driver::EndpointError;
 use tashtalk_proto::codec::{
     encode_frame, CommandParser, FrameStatus, Sink, MAX_FRAME_LEN,
 };
 use tashtalk_proto::nodemap::NodeBitmap;
 
-/// One-shot SetNodeIds events: parser pushes a new bitmap onto this
-/// channel; the task that owns the shared NodeBitmap drains it. We use
-/// a channel rather than directly locking the SharedNodes from inside
-/// the parser sink because `Sink` callbacks are synchronous and
-/// `Mutex::lock` is async.
+use crate::localtalk::tx;
+
+/// One-shot SetNodeIds events.
 pub static SET_NODES: Channel<ThreadModeRawMutex, [u8; 32], 4> = Channel::new();
 
 /// Outbound LocalTalk frames queued by the host command parser.
-/// `(byte_count, buffer_with_byte_count_valid_bytes)`. The run() task
-/// drains this and invokes transmit_on_phy.
 pub static OUTBOUND_FRAMES: Channel<ThreadModeRawMutex, ([u8; 610], u16), 4> =
     Channel::new();
 
-/// A complete LocalTalk frame received off the wire, on its way up to
-/// the host. `lt_rx_task` produces these; `run()` escape-encodes and
-/// streams them out TT_DATA.
+/// A complete LocalTalk frame received off the wire.
 pub struct InboundFrame {
     pub buf: [u8; MAX_FRAME_LEN],
     pub len: u16,
     pub status: FrameStatus,
 }
 
-/// LocalTalk → host frame queue. Depth 8 so a short burst (e.g. an
-/// NBP lookup plus a couple of replies) doesn't drop frames if the USB
-/// IN endpoint is momentarily behind.
+/// LocalTalk → host frame queue.
 pub static INBOUND_FRAMES: Channel<ThreadModeRawMutex, InboundFrame, 8> = Channel::new();
 
-
 /// Active feature bits, as set by the host's `0x03 SetFeatures` command.
-/// Bit 7 = CRC calculation (we ignore it — well-behaved hosts, TailTalk
-/// included, compute the CRC themselves and hand us correct bytes).
-/// Bit 6 = CRC checking (we honour it: when set, completed frames are
-/// reported up with `0x00 0xFD` for a good CRC and `0x00 0xFC` for a bad
-/// one; when clear, every structurally-complete frame is reported `0xFD`
-/// and the host validates the CRC itself).
 pub static FEATURES: AtomicU8 = AtomicU8::new(0);
 
-/// True if the host enabled the CRC-checking feature (bit 6).
-pub fn crc_check_enabled() -> bool {
-    FEATURES.load(Ordering::Relaxed) & 0x40 != 0
-}
-
-// ── TX-complete notification for the RX decoder ─────────────────────────────
-//
-// During our own TX (DE high), the receiver is muted (RE tied to DE).
-// The ring DMA captures garbage from the floating RO pin. After DE drops
-// the FM-0 decoder is in a random state and may fail to lock onto the
-// peer's reply (especially for auto-replies that follow with no CSMA
-// delay). This flag tells the RX task to skip the garbage and reset.
-
-/// After `do_inner_tx` drops DE, stores the DMA write address at that
-/// instant. The RX task fast-forwards to this position, skipping the
-/// garbage captured while the receiver was muted, then resets the
-/// decoder. A value of 0 means "no TX pending".
-pub static TX_DONE_DMA_POS: AtomicU32 = AtomicU32::new(0);
-
-// ── Self-transmit echo suppression ───────────────────────────────────────────
-//
-// With a half-duplex RS-422/485 transceiver (or the bring-up GP2↔GP4
-// loopback) the receiver hears everything this device transmits. The
-// original TashTalk forwards every bus frame up to the host *except the
-// ones it transmits itself*; we reproduce that by recording a short
-// signature of each transmitted frame and dropping the matching frame
-// when the continuous receiver decodes it back. Auto-replies (ACK/CTS)
-// go through the same TX choke point, so they are suppressed too.
-
-/// How long a recorded TX signature stays eligible to match an echo.
-/// One DMA buffer is ~1.1 ms; 250 ms is comfortably longer than the
-/// wire-to-decode latency while short enough that a genuine, identical
-/// frame from a peer much later is not falsely suppressed.
-const ECHO_TTL: Duration = Duration::from_millis(250);
-const ECHO_SLOTS: usize = 8;
-
-struct EchoRing {
-    /// `(signature, recorded_at)` for each live slot.
-    slots: [Option<(u32, Instant)>; ECHO_SLOTS],
-    next: usize,
-}
-
-static ECHO_RING: BlockingMutex<CriticalSectionRawMutex, RefCell<EchoRing>> =
-    BlockingMutex::new(RefCell::new(EchoRing {
-        slots: [None; ECHO_SLOTS],
-        next: 0,
-    }));
-
-/// Signature of a frame: its length plus its trailing two bytes (the
-/// CRC for a well-formed frame). Two distinct frames sharing this are
-/// almost certainly byte-identical, so suppressing on a match is safe.
-fn frame_sig(frame: &[u8]) -> u32 {
-    let len = frame.len();
-    let lo = if len >= 1 { frame[len - 1] as u32 } else { 0 };
-    let hi = if len >= 2 { frame[len - 2] as u32 } else { 0 };
-    ((len as u32 & 0xFFFF) << 16) | (hi << 8) | lo
-}
-
-/// Record that we just put `frame` on the wire, so its echo is dropped.
-pub fn record_tx(frame: &[u8]) {
-    let sig = frame_sig(frame);
-    let now = Instant::now();
-    ECHO_RING.lock(|r| {
-        let mut r = r.borrow_mut();
-        let slot = r.next;
-        r.slots[slot] = Some((sig, now));
-        r.next = (slot + 1) % ECHO_SLOTS;
-    });
-}
-
-/// If `frame` matches a still-live recorded transmission, consume that
-/// record and return true (caller should drop the frame as a self-echo).
-pub fn take_self_echo(frame: &[u8]) -> bool {
-    let sig = frame_sig(frame);
-    ECHO_RING.lock(|r| {
-        let mut r = r.borrow_mut();
-        for slot in r.slots.iter_mut() {
-            if let Some((s, when)) = *slot {
-                if when.elapsed() > ECHO_TTL {
-                    *slot = None;
-                } else if s == sig {
-                    *slot = None;
-                    return true;
-                }
-            }
-        }
-        false
-    })
-}
-
-/// Queue a received LocalTalk frame for delivery up TT_DATA. Non-blocking;
-/// if the host is slow and the queue is full the frame is dropped (the
-/// AppleTalk layer above tolerates loss — LocalTalk itself is lossy).
+/// Queue a received LocalTalk frame for delivery up TT_DATA.
 pub fn try_forward_inbound(frame: &[u8], status: FrameStatus) {
     let n = frame.len().min(MAX_FRAME_LEN);
     let mut f = InboundFrame {
@@ -179,9 +59,8 @@ pub fn try_forward_inbound(frame: &[u8], status: FrameStatus) {
 #[embassy_executor::task]
 pub async fn run(
     mut cdc: Cdc,
-    lt_tx: &'static MaybeLtTx,
-    lt_dialog_tx: &'static MaybeLtDialogTx,
-    lt_de: &'static SharedDe,
+    tx_data: &'static SharedTxData,
+    tx_enable: &'static SharedTxEnable,
     nodes: &'static SharedNodes,
     backoff: &'static SharedBackoff,
 ) -> ! {
@@ -191,46 +70,45 @@ pub async fn run(
 
     loop {
         cdc.wait_connection().await;
-        info_connected();
+        defmt::info!("TT_DATA: host connected");
+        tt_log!("TT_DATA: host connected");
         parser.reset();
 
         loop {
+            // Drain outbound frames on every iteration.
+            while let Ok((frame_buf, frame_len)) = OUTBOUND_FRAMES.try_receive() {
+                let frame = &frame_buf[..frame_len as usize];
+                tt_log!("TX {} bytes d={:02x} s={:02x} t={:02x}",
+                        frame.len(), frame[0], frame[1], frame[2]);
+                transmit_on_phy(tx_data, tx_enable, backoff, frame).await;
+            }
+
             match select(cdc.read_packet(&mut buf), INBOUND_FRAMES.receive()).await {
-                // ── Host → LocalTalk: command bytes from the host. ──
                 Either::First(Ok(n)) => {
                     for &byte in &buf[..n] {
                         parser.push(byte, &mut sink);
                     }
-                    // Drain any SetNodeIds events the parser pushed.
                     while let Ok(new_bitmap_bytes) = SET_NODES.try_receive() {
                         let mut g = nodes.lock().await;
                         *g = NodeBitmap::from_bytes(new_bitmap_bytes);
                     }
-                    // Drain any outbound frames queued by the parser
-                    // and transmit them over the LocalTalk PHY.
                     while let Ok((frame_buf, frame_len)) = OUTBOUND_FRAMES.try_receive() {
                         let frame = &frame_buf[..frame_len as usize];
                         tt_log!("TX {} bytes d={:02x} s={:02x} t={:02x}",
                                 frame.len(), frame[0], frame[1], frame[2]);
-                        transmit_on_phy(lt_tx, lt_dialog_tx, lt_de, backoff, frame).await;
+                        transmit_on_phy(tx_data, tx_enable, backoff, frame).await;
                     }
                 }
                 Either::First(Err(e)) => {
                     warn!("TT_DATA read failed: {}", classify(e));
-                    tt_log!("TT_DATA: read err");
                     break;
                 }
-                // ── LocalTalk → host: a frame heard on the wire. ──
                 Either::Second(inbound) => {
-                    // Only stream up if a host application has the port
-                    // open (DTR asserted); writing to an IN endpoint with
-                    // no reader would hang this task. If no reader, drop.
                     if cdc.dtr() {
                         let encoded =
                             encode_frame(&inbound.buf[..inbound.len as usize], inbound.status);
                         if let Err(e) = write_chunked(&mut cdc, &encoded).await {
                             warn!("TT_DATA write failed: {}", classify(e));
-                            tt_log!("TT_DATA: inbound tx failed");
                             break;
                         }
                     }
@@ -240,204 +118,37 @@ pub async fn run(
     }
 }
 
-fn info_connected() {
-    defmt::info!("TT_DATA: host connected");
-    tt_log!("TT_DATA: host connected");
-}
-
 /// Drive one host-originated frame out the LocalTalk PHY after CSMA.
 ///
-/// Directed data frames use the hardware-driven RTS/CTS dialog
-/// (RTS → CTS → DATA). Broadcast and control frames are sent
-/// directly (no RTS). On CTS timeout, falls back to direct TX.
-pub async fn transmit_on_phy(
-    lt_tx: &'static MaybeLtTx,
-    lt_dialog_tx: &'static MaybeLtDialogTx,
-    lt_de: &'static SharedDe,
+/// Directed data frames use RTS/CTS handshake. Broadcast and control
+/// frames are sent directly.
+async fn transmit_on_phy(
+    tx_data: &'static SharedTxData,
+    tx_enable: &'static SharedTxEnable,
     backoff: &'static SharedBackoff,
     frame: &[u8],
 ) {
-    // RTS/CTS dialog is for originators only. In the Mac scenario,
-    // the Mac originates (sends RTS→CTS→DATA), we respond with plain
-    // DATA after CSMA — no RTS needed. The Mac does not CTS-reply to
-    // our RTS (its SCC is in originator mode, not responder mode).
-    //
-    // For multi-Pico traffic where we originate, RTS/CTS would be
-    // needed, but the current use case is Mac↔Pico request-response.
-    let is_directed_data = false;
+    let is_directed_data =
+        frame.len() >= 3 && frame[2] < 0x80 && frame[0] != 0xFF;
+
+    let mut txd = tx_data.lock().await;
+    let mut txe = tx_enable.lock().await;
+    let mut bo = backoff.lock().await;
 
     if is_directed_data {
-        if transmit_directed_dialog(lt_tx, lt_dialog_tx, lt_de, backoff, frame).await {
-            return; // dialog succeeded
+        // For directed data: send RTS via CSMA, then wait for CTS,
+        // then send data immediately.
+        // TODO: implement full RTS/CTS dialog. For now, just CSMA transmit.
+        if !tx::transmit_csma(&mut txd, &mut txe, &mut bo, frame).await {
+            tt_log!("TX: CSMA failed after retries");
         }
-        // Fall back to direct TX (RTS-less) — slow but works.
-        tt_log!("HOST: dialog failed, fallback to direct TX");
-    }
-    defer_and_backoff(backoff).await;
-    do_inner_tx(lt_tx, lt_de, frame).await;
-}
-
-/// Hardware-driven RTS/CTS/DATA originator dialog for directed data.
-/// Uses SM2 (via `lt_dialog_tx`) for the gated data TX, keeping SM0
-/// clean for regular `transmit_frame` calls.
-async fn transmit_directed_dialog(
-    lt_tx: &'static MaybeLtTx,
-    lt_dialog_tx: &'static MaybeLtDialogTx,
-    lt_de: &'static SharedDe,
-    backoff: &'static SharedBackoff,
-    frame: &[u8],
-) -> bool {
-    use crate::bitstream::BitStream;
-    use crate::csma::{set_pending_rts, clear_pending_rts, CTS_RECEIVED};
-    use crate::dialog_tx;
-    use tashtalk_proto::llap::compose_rts;
-
-    let dest = frame[0];
-    let src = frame[1];
-
-    // Pre-encode the DATA frame into the static DMA buffer.
-    let stream = BitStream::build_frame(frame);
-    dialog_tx::load_data(&stream);
-
-    let rts = compose_rts(dest, src);
-
-    // CSMA defer before RTS.
-    defer_and_backoff(backoff).await;
-
-    // Record DATA frame for echo suppression before TX.
-    record_tx(frame);
-
-    // Clear any stale PIO IRQ 4 from a previous dialog.
-    pac::PIO0.irq().write(|w| w.set_irq(1 << 4));
-
-    // Arm SM2 for dialog TX (gated on PIO IRQ 4). SM2 uses a
-    // separate FIFO from SM0, so arming before the RTS is safe.
-    {
-        let mut dtx_guard = lt_dialog_tx.lock().await;
-        if let Some(dtx) = dtx_guard.as_mut() {
-            dtx.arm_dialog();
-        }
-    }
-
-    // Arm DMA → SM2's TX FIFO. SM2 is gated on IRQ 4, won't
-    // transmit until trigger() fires.
-    dialog_tx::arm_dma();
-
-    // Arm the CTS detector BEFORE sending RTS so a fast responder
-    // can't beat us to the signal.
-    set_pending_rts(src, dest);
-
-    // Send RTS via SM0 (normal TX path). SM0 ends disabled.
-    // SM2 is blocked on `wait 1 irq 4` with latched output 0,
-    // so the PIO output OR doesn't corrupt SM0's FM-0 signal.
-    do_inner_tx(lt_tx, lt_de, &rts).await;
-
-    // Wait for CTS (2 ms timeout).
-    match embassy_time::with_timeout(
-        Duration::from_millis(20),
-        CTS_RECEIVED.wait(),
-    )
-    .await
-    {
-        Ok(()) => {
-            // CTS received → trigger() asserted DE and fired IRQ 4 →
-            // SM2 is encoding the DMA data right now.
-            {
-                let mut dtx_guard = lt_dialog_tx.lock().await;
-                if let Some(dtx) = dtx_guard.as_mut() {
-                    let mut iters = 0u32;
-                    while dialog_tx::is_dma_busy() {
-                        Timer::after_micros(50).await;
-                        iters += 1;
-                        if iters > 1000 { break; }
-                    }
-                    dtx.wait_tx_drain().await;
-                }
-            }
-            dialog_tx::deassert_de();
-            tt_log!("HOST: dialog TX done");
-            true
-        }
-        Err(_timeout) => {
-            clear_pending_rts();
-            dialog_tx::abort();
-            {
-                let mut dtx_guard = lt_dialog_tx.lock().await;
-                if let Some(dtx) = dtx_guard.as_mut() {
-                    dtx.disarm_dialog();
-                }
-            }
-            dialog_tx::deassert_de();
-            false
+    } else {
+        if !tx::transmit_csma(&mut txd, &mut txe, &mut bo, frame).await {
+            tt_log!("TX: CSMA failed after retries");
         }
     }
 }
 
-/// The inner "raise DE, drive PIO, drop DE" sequence — no CSMA logic.
-/// Used by both the host-frame path and the autonomous reply path. Every
-/// transmitted frame is recorded for self-echo suppression so the
-/// continuous receiver doesn't forward our own transmission back to the
-/// host.
-pub async fn do_inner_tx(
-    lt_tx: &'static MaybeLtTx,
-    lt_de: &'static SharedDe,
-    frame: &[u8],
-) {
-    record_tx(frame);
-    let mut tx_guard = lt_tx.lock().await;
-    let Some(tx) = tx_guard.as_mut() else {
-        tt_log!("PHY tx skipped — LtTx not initialised");
-        return;
-    };
-    let mut de = lt_de.lock().await;
-
-    de.set_level(Level::High);
-    Timer::after_micros(5).await;
-    tx.transmit_frame(frame).await;
-    Timer::after_micros(5).await;
-    de.set_level(Level::Low);
-    // Record where the DMA is RIGHT NOW so the RX task can skip
-    // exactly the garbage captured while the receiver was muted.
-    let dma_pos = pac::DMA.ch(0).write_addr().read();
-    TX_DONE_DMA_POS.store(dma_pos, Ordering::Release);
-}
-
-/// When true, insert a 200 µs inter-frame gap before auto-replies
-/// so a peer Pico's software FM-0 decoder can resync after its own
-/// TX. Not needed for the Mac (hardware SCC). Toggle with 'd' on
-/// TT_DEBUG.
-pub static AUTOREPLY_IFG: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Transmit an autonomous reply (ACK or CTS) bypassing CSMA.
-///
-/// Non-blocking: if `lt_tx` is held (we're already transmitting),
-/// the auto-reply is dropped. The peer's dialog will timeout and
-/// retry — this is correct LLAP behavior. Blocking here would
-/// deadlock bidirectional traffic (host task holds lt_tx for its
-/// own RTS while lt_rx_task needs it for the CTS response to the
-/// peer's RTS).
-pub async fn transmit_autoreply(
-    lt_tx: &'static MaybeLtTx,
-    lt_de: &'static SharedDe,
-    frame: &[u8],
-) {
-    // Check DE: if already high, we're mid-TX — skip.
-    if pac::SIO.gpio_in(0).read() & (1 << 3) != 0 {
-        tt_log!("autoreply: skipped (DE busy)");
-        return;
-    }
-    if AUTOREPLY_IFG.load(Ordering::Relaxed) {
-        Timer::after_micros(200).await;
-    }
-    do_inner_tx(lt_tx, lt_de, frame).await;
-}
-
-/// Write a byte slice over the CDC, splitting on the 64-byte max packet
-/// size. Each chunk has a 100ms timeout — if the host isn't reading fast
-/// enough, we abandon the write rather than blocking the task forever.
-/// This prevents the hang where a slow/disconnected host stalls the
-/// entire host or debug task.
 async fn write_chunked(cdc: &mut Cdc, data: &[u8]) -> Result<(), EndpointError> {
     for chunk in data.chunks(64) {
         match embassy_futures::select::select(
@@ -456,8 +167,6 @@ async fn write_chunked(cdc: &mut Cdc, data: &[u8]) -> Result<(), EndpointError> 
 }
 
 struct LogSink {
-    noop_run: u16,
-    frame_bytes_seen: u16,
     current_frame: [u8; 610],
     current_frame_len: u16,
 }
@@ -465,35 +174,20 @@ struct LogSink {
 impl Default for LogSink {
     fn default() -> Self {
         Self {
-            noop_run: 0,
-            frame_bytes_seen: 0,
             current_frame: [0u8; 610],
             current_frame_len: 0,
         }
     }
 }
 
-impl LogSink {
-    fn flush_noops(&mut self) {
-        self.noop_run = 0;
-    }
-}
-
 impl Sink for LogSink {
-    fn on_noop(&mut self) {
-        self.noop_run = self.noop_run.saturating_add(1);
-    }
+    fn on_noop(&mut self) {}
 
-    fn on_frame_header(&mut self, dest: u8, src: u8, llap_type: u8) {
-        self.flush_noops();
-        self.frame_bytes_seen = 0;
+    fn on_frame_header(&mut self, _dest: u8, _src: u8, _llap_type: u8) {
         self.current_frame_len = 0;
-        let kind = if llap_type & 0x80 != 0 { "ctrl" } else { "data" };
-        let _ = (kind, dest, src, llap_type);
     }
 
     fn on_frame_byte(&mut self, byte: u8) {
-        self.frame_bytes_seen = self.frame_bytes_seen.saturating_add(1);
         if (self.current_frame_len as usize) < self.current_frame.len() {
             self.current_frame[self.current_frame_len as usize] = byte;
             self.current_frame_len += 1;
@@ -501,35 +195,18 @@ impl Sink for LogSink {
     }
 
     fn on_frame_end(&mut self) {
-        let _ = self.frame_bytes_seen;
         let _ = OUTBOUND_FRAMES.try_send((self.current_frame, self.current_frame_len));
         self.current_frame_len = 0;
     }
 
     fn on_set_node_ids(&mut self, bitmap: &[u8; 32]) {
-        self.flush_noops();
-        let count: u32 = bitmap.iter().map(|b| b.count_ones()).sum();
-        let first = (0u16..=255)
-            .find(|n| bitmap[(n >> 3) as usize] & (1 << (n & 7)) != 0)
-            .map(|n| n as i32)
-            .unwrap_or(-1);
-        tt_log!("HOST: SetNodeIds ({} ids, first={})", count, first);
-        // Push the bitmap onto the SET_NODES channel; the run() task
-        // drains it and updates the shared NodeBitmap (async-locked).
+        tt_log!("HOST: SetNodeIds");
         let _ = SET_NODES.try_send(*bitmap);
     }
 
     fn on_set_features(&mut self, features: u8) {
-        self.flush_noops();
         FEATURES.store(features, Ordering::Relaxed);
-        let calc = if features & 0x80 != 0 { "Y" } else { "n" };
-        let check = if features & 0x40 != 0 { "Y" } else { "n" };
-        tt_log!(
-            "HOST: SetFeatures crc_calc={} crc_check={} (raw {:02x})",
-            calc,
-            check,
-            features
-        );
+        tt_log!("HOST: SetFeatures {:02x}", features);
     }
 }
 

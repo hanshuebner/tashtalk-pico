@@ -195,6 +195,83 @@ impl Default for Fm0Decoder {
     }
 }
 
+// ── FM-0 Encoder (TX path) ────────────────────────────────────────────
+//
+// Converts a stream of HDLC bits into FM-0 half-cell symbols suitable
+// for direct shift-out by the PIO TX state machine at 2× the bit rate
+// (460.8 kHz for LocalTalk's 230.4 kbps).
+//
+// FM-0 encoding rules:
+//   - At every bit-cell boundary: toggle the output level.
+//   - For a `0` bit: also toggle at mid-cell.
+//   - For a `1` bit: hold through mid-cell (no toggle).
+//
+// Each data bit produces exactly 2 half-cell symbols.
+
+/// Stateful FM-0 encoder.
+///
+/// Tracks the current output level across successive calls to
+/// [`encode_bit`](Self::encode_bit) so that the mandatory boundary
+/// toggle is correct even when bits are fed one at a time.
+#[derive(Debug, Clone, Copy)]
+pub struct Fm0Encoder {
+    /// Current output level (`false` = LOW, `true` = HIGH).
+    level: bool,
+}
+
+impl Fm0Encoder {
+    /// Create a new encoder starting with output LOW.
+    pub const fn new() -> Self {
+        Self { level: false }
+    }
+
+    /// Encode one data bit, returning the two half-cell symbols
+    /// `(boundary, mid)` as `u8` values (0 or 1).
+    #[inline]
+    pub fn encode_bit(&mut self, bit: u8) -> (u8, u8) {
+        // Boundary: always toggle.
+        self.level = !self.level;
+        let boundary = self.level as u8;
+
+        if bit == 0 {
+            // Mid-cell: toggle again for '0'.
+            self.level = !self.level;
+        }
+        // For '1': hold (no toggle).
+        let mid = self.level as u8;
+
+        (boundary, mid)
+    }
+
+    /// Encode a slice of bits, appending half-cell symbols to `out`.
+    /// Each bit produces 2 symbols.
+    pub fn encode_bits(&mut self, bits: &[u8], out: &mut heapless::Vec<u8, MAX_FM0_SYMBOLS>) {
+        for &b in bits {
+            let (a, b) = self.encode_bit(b);
+            let _ = out.push(a);
+            let _ = out.push(b);
+        }
+    }
+
+    /// Current output level.
+    pub fn level(&self) -> bool {
+        self.level
+    }
+}
+
+impl Default for Fm0Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Maximum FM-0 symbol buffer size.
+///
+/// Worst case: a max-length LLAP frame (605 bytes) bit-stuffed (≤~726
+/// bytes) + 2 flags (16 bits) + 1 closing flag (8 bits) + 16 abort bits
+/// ≈ 6000 bits → 12000 half-cell symbols. We round up generously.
+pub const MAX_FM0_SYMBOLS: usize = 16384;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +406,125 @@ mod tests {
         let (_, samples) = encode_bits(0, &bits, 4);
         let events = decode(samples, 4);
         assert!(events.contains(&Fm0Event::Flag), "events: {:?}", events);
+    }
+
+    // ── Encoder tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn encoder_zero_bit_toggles_twice() {
+        let mut enc = Fm0Encoder::new();
+        // Starting LOW. Bit 0: boundary→HIGH, mid→LOW.
+        let (a, b) = enc.encode_bit(0);
+        assert_eq!((a, b), (1, 0));
+        assert!(!enc.level());
+    }
+
+    #[test]
+    fn encoder_one_bit_toggles_once() {
+        let mut enc = Fm0Encoder::new();
+        // Starting LOW. Bit 1: boundary→HIGH, hold→HIGH.
+        let (a, b) = enc.encode_bit(1);
+        assert_eq!((a, b), (1, 1));
+        assert!(enc.level());
+    }
+
+    #[test]
+    fn encoder_level_continuity() {
+        let mut enc = Fm0Encoder::new();
+        // Bit 1 from LOW: → HIGH (boundary), HIGH (hold). Level=HIGH.
+        assert_eq!(enc.encode_bit(1), (1, 1));
+        // Bit 1 from HIGH: → LOW (boundary), LOW (hold). Level=LOW.
+        assert_eq!(enc.encode_bit(1), (0, 0));
+        // Bit 0 from LOW: → HIGH (boundary), LOW (mid-toggle). Level=LOW.
+        assert_eq!(enc.encode_bit(0), (1, 0));
+        // Bit 0 from LOW again: → HIGH, LOW. Level=LOW.
+        assert_eq!(enc.encode_bit(0), (1, 0));
+    }
+
+    #[test]
+    fn encoder_always_transitions_at_boundary() {
+        // The defining rule of FM-0: every bit cell starts with a transition.
+        let mut enc = Fm0Encoder::new();
+        let test_bits = [0u8, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0];
+        let mut prev_mid = 0u8; // encoder starts LOW, first boundary must differ
+        for (i, &bit) in test_bits.iter().enumerate() {
+            let (boundary, mid) = enc.encode_bit(bit);
+            if i == 0 {
+                // First bit: boundary must differ from initial level (0).
+                assert_ne!(boundary, 0, "bit {i}: boundary must toggle from initial");
+            } else {
+                // Boundary must differ from the previous mid (= end of prev cell).
+                assert_ne!(
+                    boundary, prev_mid,
+                    "bit {i}: boundary must toggle from prev mid"
+                );
+            }
+            prev_mid = mid;
+        }
+    }
+
+    /// Feed FM-0 encoder output (1 sample per half-cell) through the
+    /// decoder (which expects N samples per half-cell) by stretching.
+    fn decode_from_encoder(symbols: &[u8], half: usize) -> alloc::vec::Vec<Fm0Event> {
+        // Stretch each symbol to `half` samples.
+        let mut samples: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        for &s in symbols {
+            for _ in 0..half {
+                samples.push(s);
+            }
+        }
+        decode(samples, half)
+    }
+
+    #[test]
+    fn encoder_decoder_round_trip_byte() {
+        // Encode a flag + byte + flag, decode, verify byte comes back.
+        let flag_bits = [0u8, 1, 1, 1, 1, 1, 1, 0];
+        let val = 0xA5u8;
+        let data_bits: alloc::vec::Vec<u8> = (0..8).map(|i| (val >> i) & 1).collect();
+
+        let mut enc = Fm0Encoder::new();
+        let mut symbols = alloc::vec::Vec::new();
+        for &b in &flag_bits {
+            let (a, c) = enc.encode_bit(b);
+            symbols.push(a);
+            symbols.push(c);
+        }
+        for &b in &data_bits {
+            let (a, c) = enc.encode_bit(b);
+            symbols.push(a);
+            symbols.push(c);
+        }
+        for &b in &flag_bits {
+            let (a, c) = enc.encode_bit(b);
+            symbols.push(a);
+            symbols.push(c);
+        }
+
+        let events = decode_from_encoder(&symbols, 4);
+        assert!(
+            events.contains(&Fm0Event::Byte(val)),
+            "expected Byte(0x{val:02X}), got: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn encoder_decoder_round_trip_flag() {
+        let flag_bits = [0u8, 1, 1, 1, 1, 1, 1, 0];
+        let mut enc = Fm0Encoder::new();
+        let mut symbols = alloc::vec::Vec::new();
+        for &b in &flag_bits {
+            let (a, c) = enc.encode_bit(b);
+            symbols.push(a);
+            symbols.push(c);
+        }
+
+        let events = decode_from_encoder(&symbols, 4);
+        assert!(
+            events.contains(&Fm0Event::Flag),
+            "expected Flag, got: {:?}",
+            events
+        );
     }
 }

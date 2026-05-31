@@ -1,0 +1,410 @@
+//! HDLC frame builder for the LocalTalk TX path.
+//!
+//! Constructs a complete HDLC bitstream from an LLAP frame:
+//!
+//! ```text
+//! [Flag][Flag][bit-stuffed payload+CRC][Flag][Abort]
+//! ```
+//!
+//! The output is a sequence of raw bits (one bit per `u8`, value 0 or 1)
+//! ready for FM-0 encoding. Flags and abort are NOT bit-stuffed; only
+//! the payload + CRC region is.
+//!
+//! ## Sync pulse
+//!
+//! The CSMA/CA sync pulse (1 bit ON, 2 bits OFF) is NOT part of this
+//! module — it lives in the TX pipeline that combines HDLC + FM-0 +
+//! sync into a PIO-ready buffer (see [`crate::fm0`] and the firmware's
+//! PIO layer).
+
+use heapless::Vec;
+
+use crate::bitstuff::FLAG;
+use crate::codec::MAX_FRAME_LEN;
+use crate::crc::CrcCalculator;
+
+/// Number of opening flag bytes.
+const NUM_OPENING_FLAGS: usize = 2;
+
+/// Number of abort bits (continuous 1s) appended after the closing flag.
+/// The spec says 12-18; we use 16 (2 bytes worth).
+const NUM_ABORT_BITS: usize = 16;
+
+/// Maximum output bits for a fully framed HDLC bitstream.
+///
+/// Breakdown (worst case):
+/// - 2 flags × 8 bits = 16
+/// - 605 payload bytes × 8 = 4840 data bits, ≤ 968 stuff bits = ~5808
+/// - 2 CRC bytes × 8 = 16 data bits, ≤ 4 stuff bits = ~20
+/// - 1 closing flag = 8
+/// - 16 abort bits
+/// Total ≤ ~5868 bits. We round up.
+pub const MAX_HDLC_BITS: usize = 8192;
+
+/// Bit vector type for HDLC output.
+pub type HdlcBits = Vec<u8, MAX_HDLC_BITS>;
+
+/// Build a complete HDLC bitstream from an LLAP frame (header + data,
+/// no CRC — CRC is computed and appended here).
+///
+/// Output: one `u8` per bit (value 0 or 1), LSB-first within each byte
+/// of the original frame. Ready for FM-0 encoding.
+///
+/// Returns `None` if the frame is too short (< 3 bytes: dest, src, type).
+pub fn build_hdlc_bitstream(frame: &[u8]) -> Option<HdlcBits> {
+    if frame.len() < 3 || frame.len() > MAX_FRAME_LEN {
+        return None;
+    }
+
+    let mut bits = HdlcBits::new();
+
+    // Opening flags (not bit-stuffed).
+    for _ in 0..NUM_OPENING_FLAGS {
+        push_byte_as_bits(&mut bits, FLAG);
+    }
+
+    // Compute CRC over the raw frame bytes.
+    let mut crc = CrcCalculator::new();
+    crc.feed(frame);
+    let crc_bytes = [crc.byte1(), crc.byte2()];
+
+    // Bit-stuff the payload + CRC.
+    let mut ones: u8 = 0;
+    for &byte in frame.iter().chain(crc_bytes.iter()) {
+        for bit_idx in 0..8u8 {
+            let bit = (byte >> bit_idx) & 1;
+            let _ = bits.push(bit);
+            if bit == 1 {
+                ones += 1;
+                if ones == 5 {
+                    let _ = bits.push(0); // stuff bit
+                    ones = 0;
+                }
+            } else {
+                ones = 0;
+            }
+        }
+    }
+
+    // Closing flag (not bit-stuffed).
+    push_byte_as_bits(&mut bits, FLAG);
+
+    // Abort sequence: continuous 1s.
+    for _ in 0..NUM_ABORT_BITS {
+        let _ = bits.push(1);
+    }
+
+    Some(bits)
+}
+
+/// Push 8 bits of a byte (LSB first) into the bit vector.
+fn push_byte_as_bits(bits: &mut HdlcBits, byte: u8) {
+    for i in 0..8u8 {
+        let _ = bits.push((byte >> i) & 1);
+    }
+}
+
+// ── Full TX pipeline ──────────────────────────────────────────────────
+
+use crate::fm0::{Fm0Encoder, MAX_FM0_SYMBOLS};
+
+/// FM-0 encoded symbol buffer, ready for PIO shift-out.
+pub type Fm0Buffer = Vec<u8, MAX_FM0_SYMBOLS>;
+
+/// Number of half-cells for the sync pulse ON phase (1 bit time = 2 half-cells).
+const SYNC_ON_HALFCELLS: usize = 2;
+
+/// Number of half-cells for the sync pulse silence (2 bit times = 4 half-cells).
+const SYNC_OFF_HALFCELLS: usize = 4;
+
+/// Build a PIO-ready FM-0 symbol buffer for a CSMA/CA transmission.
+///
+/// The output includes:
+/// 1. Sync pulse region: `SYNC_ON_HALFCELLS` of don't-care data
+///    (TX_EN controls whether this appears on the wire) followed by
+///    `SYNC_OFF_HALFCELLS` of don't-care silence.
+/// 2. The HDLC frame FM-0 encoded: flags + bit-stuffed payload+CRC +
+///    closing flag + abort.
+///
+/// The companion TX Enable SM (SM1) must be loaded with matching
+/// timing commands to gate the RS-422 driver.
+///
+/// Returns `(fm0_symbols, frame_halfcells)` where `frame_halfcells`
+/// is the count of half-cells in the frame portion (for SM1's frame
+/// duration command).
+///
+/// Returns `None` if the frame is invalid.
+pub fn build_tx_buffer(frame: &[u8]) -> Option<(Fm0Buffer, u32)> {
+    let hdlc_bits = build_hdlc_bitstream(frame)?;
+
+    let mut fm0 = Fm0Buffer::new();
+    let mut enc = Fm0Encoder::new();
+
+    // Phase 1: Sync pulse ON (content doesn't matter, TX_EN gates it).
+    // Encode arbitrary bits so the encoder state advances consistently.
+    for _ in 0..SYNC_ON_HALFCELLS {
+        let _ = fm0.push(0);
+    }
+
+    // Phase 2: Sync pulse silence (TX disabled, content doesn't matter).
+    for _ in 0..SYNC_OFF_HALFCELLS {
+        let _ = fm0.push(0);
+    }
+
+    // Phase 3: HDLC frame, FM-0 encoded.
+    let frame_start = fm0.len();
+    for &bit in hdlc_bits.iter() {
+        let (a, b) = enc.encode_bit(bit);
+        let _ = fm0.push(a);
+        let _ = fm0.push(b);
+    }
+    let frame_halfcells = (fm0.len() - frame_start) as u32;
+
+    Some((fm0, frame_halfcells))
+}
+
+/// Build a PIO-ready FM-0 symbol buffer for an immediate transmission
+/// (CTS, ACK, data-after-CTS) — NO sync pulse, NO silence gap.
+///
+/// Used for responses within an established dialog where CSMA/CA
+/// does not apply and the response must arrive within the IFG
+/// (200 µs).
+///
+/// Returns `None` if the frame is invalid.
+pub fn build_immediate_tx_buffer(frame: &[u8]) -> Option<Fm0Buffer> {
+    let hdlc_bits = build_hdlc_bitstream(frame)?;
+
+    let mut fm0 = Fm0Buffer::new();
+    let mut enc = Fm0Encoder::new();
+
+    for &bit in hdlc_bits.iter() {
+        let (a, b) = enc.encode_bit(bit);
+        let _ = fm0.push(a);
+        let _ = fm0.push(b);
+    }
+
+    Some(fm0)
+}
+
+/// Build the TX Enable SM command sequence for a CSMA/CA transmission.
+///
+/// Returns an array of `(duration_halfcells, pin_value)` pairs:
+/// 1. `(SYNC_ON, 1)` — enable for sync pulse
+/// 2. `(SYNC_OFF, 0)` — disable for silence
+/// 3. `(frame_halfcells, 1)` — enable for frame
+/// 4. `(0, 0)` — disable after frame
+pub fn build_tx_enable_sequence(frame_halfcells: u32) -> [(u32, u8); 4] {
+    [
+        (SYNC_ON_HALFCELLS as u32, 1),
+        (SYNC_OFF_HALFCELLS as u32, 0),
+        (frame_halfcells, 1),
+        (0, 0),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitstuff::BitUnstuffer;
+    use crate::bitstuff::UnstuffEvent;
+    use crate::crc::lt_crc;
+
+    /// Helper: feed all bits from an HDLC bitstream through the
+    /// unstuffer, collecting events.
+    fn unstuff_bitstream(bits: &[u8]) -> std::vec::Vec<UnstuffEvent> {
+        let mut u = BitUnstuffer::new();
+        let mut events = std::vec::Vec::new();
+        for &bit in bits {
+            let ev = u.feed_bit(bit);
+            if ev != UnstuffEvent::None {
+                events.push(ev);
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn basic_control_frame() {
+        // ENQ frame: [dest=0x42, src=0x01, type=0x81]
+        let frame = [0x42u8, 0x01, 0x81];
+        let bits = build_hdlc_bitstream(&frame).unwrap();
+
+        let events = unstuff_bitstream(&bits);
+
+        // Expect: Flag, Flag, 0x42, 0x01, 0x81, CRC1, CRC2, Flag, Abort
+        let crc = lt_crc(&frame);
+        assert!(events.len() >= 7, "events: {:?}", events);
+        assert_eq!(events[0], UnstuffEvent::Flag);
+        assert_eq!(events[1], UnstuffEvent::Flag);
+        assert_eq!(events[2], UnstuffEvent::Byte(0x42));
+        assert_eq!(events[3], UnstuffEvent::Byte(0x01));
+        assert_eq!(events[4], UnstuffEvent::Byte(0x81));
+        assert_eq!(events[5], UnstuffEvent::Byte(crc[0]));
+        assert_eq!(events[6], UnstuffEvent::Byte(crc[1]));
+        assert_eq!(events[7], UnstuffEvent::Flag);
+        assert_eq!(events[8], UnstuffEvent::Abort);
+    }
+
+    #[test]
+    fn crc_validates_after_unstuff() {
+        let frame = [0x42u8, 0x01, 0x81];
+        let bits = build_hdlc_bitstream(&frame).unwrap();
+        let events = unstuff_bitstream(&bits);
+
+        // Collect payload bytes (between first non-flag and closing flag).
+        let payload_bytes: std::vec::Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                UnstuffEvent::Byte(b) => Some(*b),
+                _ => None,
+            })
+            .collect();
+
+        // Feed all payload bytes (including CRC) through CRC calculator.
+        let mut crc = crate::crc::CrcCalculator::new();
+        crc.feed(&payload_bytes);
+        assert!(crc.is_ok(), "CRC validation failed, reg=0x{:04X}", crc.reg());
+    }
+
+    #[test]
+    fn data_frame_with_payload() {
+        // Data frame with some payload bytes.
+        let mut frame = [0u8; 10];
+        frame[0] = 0xFF; // dest (broadcast)
+        frame[1] = 0x42; // src
+        frame[2] = 0x01; // type (DDP short)
+        frame[3..10].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03]);
+
+        let bits = build_hdlc_bitstream(&frame).unwrap();
+        let events = unstuff_bitstream(&bits);
+
+        // Verify structure: Flag, Flag, bytes..., Flag, Abort
+        assert_eq!(events[0], UnstuffEvent::Flag);
+        assert_eq!(events[1], UnstuffEvent::Flag);
+
+        // Collect data bytes.
+        let payload: std::vec::Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                UnstuffEvent::Byte(b) => Some(*b),
+                _ => None,
+            })
+            .collect();
+
+        // payload = frame bytes + 2 CRC bytes
+        assert_eq!(payload.len(), frame.len() + 2);
+        assert_eq!(&payload[..frame.len()], &frame);
+
+        // CRC should validate.
+        let mut crc = crate::crc::CrcCalculator::new();
+        crc.feed(&payload);
+        assert!(crc.is_ok());
+    }
+
+    #[test]
+    fn all_ff_payload_bitstuffs_correctly() {
+        // 0xFF bytes have runs of 8 ones, which must be bit-stuffed.
+        let frame = [0xFF, 0xFF, 0xFF];
+        let bits = build_hdlc_bitstream(&frame).unwrap();
+        let events = unstuff_bitstream(&bits);
+
+        let payload: std::vec::Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                UnstuffEvent::Byte(b) => Some(*b),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(&payload[..3], &[0xFF, 0xFF, 0xFF]);
+
+        let mut crc = crate::crc::CrcCalculator::new();
+        crc.feed(&payload);
+        assert!(crc.is_ok());
+    }
+
+    #[test]
+    fn rejects_too_short_frame() {
+        assert!(build_hdlc_bitstream(&[0x42, 0x01]).is_none());
+        assert!(build_hdlc_bitstream(&[]).is_none());
+    }
+
+    #[test]
+    fn minimum_frame_works() {
+        // Minimum valid LLAP: 3 bytes (dest, src, type).
+        let frame = [0x42, 0x42, 0x82]; // ACK
+        let bits = build_hdlc_bitstream(&frame).unwrap();
+        assert!(!bits.is_empty());
+
+        let events = unstuff_bitstream(&bits);
+        assert!(events.contains(&UnstuffEvent::Flag));
+        assert!(events.contains(&UnstuffEvent::Abort));
+    }
+
+    #[test]
+    fn bitstream_starts_with_flags_ends_with_abort() {
+        let frame = [0x42, 0x01, 0x81];
+        let bits = build_hdlc_bitstream(&frame).unwrap();
+
+        // First 16 bits should be two flag bytes (0x7E LSB-first).
+        let flag_bits_expected = [0u8, 1, 1, 1, 1, 1, 1, 0];
+        assert_eq!(&bits[0..8], &flag_bits_expected);
+        assert_eq!(&bits[8..16], &flag_bits_expected);
+
+        // Last NUM_ABORT_BITS should all be 1.
+        let abort_region = &bits[bits.len() - NUM_ABORT_BITS..];
+        assert!(
+            abort_region.iter().all(|&b| b == 1),
+            "abort region: {:?}",
+            abort_region
+        );
+    }
+
+    // ── TX pipeline tests ─────────────────────────────────────────────
+
+    #[test]
+    fn tx_buffer_has_sync_prefix() {
+        let frame = [0x42, 0x01, 0x81];
+        let (buf, _) = build_tx_buffer(&frame).unwrap();
+
+        // First SYNC_ON_HALFCELLS + SYNC_OFF_HALFCELLS = 6 symbols
+        // are the sync pulse region.
+        assert!(buf.len() > SYNC_ON_HALFCELLS + SYNC_OFF_HALFCELLS);
+    }
+
+    #[test]
+    fn tx_buffer_frame_halfcells_matches() {
+        let frame = [0x42, 0x01, 0x81];
+        let (buf, frame_hc) = build_tx_buffer(&frame).unwrap();
+
+        let total_sync = SYNC_ON_HALFCELLS + SYNC_OFF_HALFCELLS;
+        let expected_frame_hc = buf.len() - total_sync;
+        assert_eq!(frame_hc as usize, expected_frame_hc);
+    }
+
+    #[test]
+    fn tx_enable_sequence_structure() {
+        let seq = build_tx_enable_sequence(200);
+        assert_eq!(seq[0], (SYNC_ON_HALFCELLS as u32, 1));  // sync ON
+        assert_eq!(seq[1], (SYNC_OFF_HALFCELLS as u32, 0)); // silence
+        assert_eq!(seq[2], (200, 1));                        // frame
+        assert_eq!(seq[3], (0, 0));                          // disable
+    }
+
+    #[test]
+    fn immediate_tx_buffer_has_no_sync() {
+        let frame = [0x42, 0x01, 0x81];
+        let imm = build_immediate_tx_buffer(&frame).unwrap();
+        let (full, _) = build_tx_buffer(&frame).unwrap();
+
+        // Immediate buffer should be shorter by the sync region.
+        let sync_size = SYNC_ON_HALFCELLS + SYNC_OFF_HALFCELLS;
+        assert_eq!(imm.len() + sync_size, full.len());
+    }
+
+    #[test]
+    fn tx_buffer_rejects_invalid_frame() {
+        assert!(build_tx_buffer(&[0x42]).is_none());
+        assert!(build_immediate_tx_buffer(&[]).is_none());
+    }
+}

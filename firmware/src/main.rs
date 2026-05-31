@@ -15,6 +15,13 @@
 //! (numbering depends on enumeration order — order is documented in the
 //! USB descriptors so a host-side udev rule can disambiguate by interface
 //! string).
+//!
+//! ## Pin assignments
+//!
+//! - **GP2** — TX data (PIO0 SM0 OUT pin → MAX-485 DI)
+//! - **GP3** — TX enable / driver enable (PIO0 SM1 SET pin → MAX-485 DE)
+//! - **GP4** — RX data (PIO1 SM0 JMP PIN ← MAX-485 RO)
+//! - **GP5** — Carrier sense (PIO1 SM0 SET pin → PIO0 SM1 JMP PIN, internal)
 
 #![no_std]
 #![no_main]
@@ -25,6 +32,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
 use defmt_rtt as _;
+
 
 /// No-init RAM buffer that the panic handler writes to before rebooting
 /// into BOOTSEL. Survives the reset (RP2040 SRAM is volatile only to
@@ -38,18 +46,12 @@ const PANIC_MARKER: &[u8] = b"\xDEPANIC_BUF\xDE ";
 
 /// Custom panic handler — writes a recognizable marker + file:line:col
 /// + (truncated) panic message into PANIC_BUF, then reboots to BOOTSEL.
-/// The next firmware boot can read PANIC_BUF and report the last panic
-/// (or a host can dump SRAM with picotool and grep for `PANIC_MARKER`).
 #[panic_handler]
 fn panic_handler(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write;
-    // SAFETY: panics are single-threaded (other tasks frozen on panic in
-    // cooperative async); we own this buffer for the duration.
-    let buf = unsafe {
-        let ptr = PANIC_BUF.as_mut_ptr() as *mut [u8; 512];
-        &mut *ptr
-    };
-    // Clear, then write the marker + location.
+    // SAFETY: panics are single-threaded (other tasks frozen); we own
+    // this buffer exclusively for the remainder of this diverging function.
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(PANIC_BUF).cast::<[u8; 512]>() };
     for b in buf.iter_mut() {
         *b = 0;
     }
@@ -64,8 +66,6 @@ fn panic_handler(info: &core::panic::PanicInfo) -> ! {
         let _ = write!(&mut w, "<no location> ");
     }
     let _ = write!(&mut w, "msg=");
-    // PanicInfo::message() is unstable, but we can format with %s of info
-    // itself which yields "panicked at ..." text.
     let _ = write!(&mut w, "{}", info);
 
     embassy_rp::rom_data::reset_to_usb_boot(0, 0);
@@ -91,16 +91,9 @@ impl core::fmt::Write for SliceWriter<'_> {
     }
 }
 
-mod bitstream;
-mod csma;
-mod debug;
-mod dialog_tx;
+mod localtalk;
 mod host;
-mod lt;
-mod lt_phy;
-mod lt_rx_task;
-mod pio_rx;
-mod pio_tx;
+mod debug;
 #[macro_use]
 mod tt_log;
 mod usb_dev;
@@ -108,19 +101,15 @@ mod usb_dev;
 use tashtalk_proto::backoff::BackoffState;
 use tashtalk_proto::nodemap::NodeBitmap;
 
-pub use csma::SharedBackoff;
-pub type SharedNodes = Mutex<ThreadModeRawMutex, NodeBitmap>;
-
-use embassy_rp::gpio::{Level, Output};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
 use static_cell::StaticCell;
 
-pub type SharedLtTx = Mutex<ThreadModeRawMutex, lt_phy::LtTx<'static>>;
-pub type MaybeLtTx = Mutex<ThreadModeRawMutex, Option<lt_phy::LtTx<'static>>>;
-pub type MaybeLtRx = Mutex<ThreadModeRawMutex, Option<lt_phy::LtRx<'static>>>;
-pub type MaybeLtDialogTx = Mutex<ThreadModeRawMutex, Option<lt_phy::LtDialogTx<'static>>>;
-pub type SharedDe = Mutex<ThreadModeRawMutex, Output<'static>>;
+pub type SharedNodes = Mutex<ThreadModeRawMutex, NodeBitmap>;
+pub type SharedBackoff = Mutex<ThreadModeRawMutex, BackoffState>;
+pub type SharedTxData = Mutex<ThreadModeRawMutex, localtalk::phy::LtTxData<'static>>;
+pub type SharedTxEnable = Mutex<ThreadModeRawMutex, localtalk::phy::LtTxEnable<'static>>;
+pub type SharedRx = Mutex<ThreadModeRawMutex, localtalk::phy::LtRx<'static>>;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -131,58 +120,54 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     info!("tashtalk-pico booting");
 
-    // ── LocalTalk PHY (PIO TX + RX) ──────────────────────────────────
-    // GP2 = LT_DATA TX (PIO0 SM0). GP3 = LT_DE (M0+ GPIO).
-    // GP4 = LT_DATA RX (PIO0 SM1) — for self-loopback, jumper GP2 to GP4.
-    let (lt_tx, lt_rx, lt_dialog_tx) = lt_phy::init_phy(p.PIO0, lt_phy::PioIrqs {}, p.PIN_2, p.PIN_4);
-    let de = Output::new(p.PIN_3, Level::Low);
+    // ── LocalTalk PHY ────────────────────────────────────────────────
+    // GP2 = TX data, GP3 = TX enable (DE), GP4 = RX data, GP5 = carrier sense
+    info!("PHY: init_phy starting");
+    let (tx_data, tx_enable, rx) = localtalk::phy::init_phy(
+        p.PIO0,
+        localtalk::phy::Pio0Irqs {},
+        p.PIO1,
+        localtalk::phy::Pio1Irqs {},
+        p.PIN_2,  // TX data
+        p.PIN_3,  // TX enable / DE
+        p.PIN_4,  // RX data
+        p.PIN_5,  // carrier sense (internal)
+    );
 
-    static LT_DE: StaticCell<SharedDe> = StaticCell::new();
-    let lt_de: &'static SharedDe = LT_DE.init(Mutex::new(de));
-    static LT_TX: StaticCell<MaybeLtTx> = StaticCell::new();
-    let lt_tx: &'static MaybeLtTx = LT_TX.init(Mutex::new(Some(lt_tx)));
-    static LT_RX: StaticCell<MaybeLtRx> = StaticCell::new();
-    let lt_rx: &'static MaybeLtRx = LT_RX.init(Mutex::new(Some(lt_rx)));
-    static LT_DIALOG_TX: StaticCell<MaybeLtDialogTx> = StaticCell::new();
-    let lt_dialog_tx: &'static MaybeLtDialogTx = LT_DIALOG_TX.init(Mutex::new(Some(lt_dialog_tx)));
+    info!("PHY: init_phy done");
 
-    // Shared node-ID bitmap. Empty at boot: the autoresponder defends
-    // nothing until a host claims node IDs via the 0x02 SetNodeIds
-    // opcode. (A non-empty default would make the Pico squat on a node
-    // and answer ENQs for it, corrupting a host stack's own LocalTalk
-    // address acquisition.)
-    let initial_nodes = NodeBitmap::empty();
+    static TX_DATA: StaticCell<SharedTxData> = StaticCell::new();
+    let tx_data: &'static SharedTxData = TX_DATA.init(Mutex::new(tx_data));
+
+    static TX_ENABLE: StaticCell<SharedTxEnable> = StaticCell::new();
+    let tx_enable: &'static SharedTxEnable = TX_ENABLE.init(Mutex::new(tx_enable));
+
+    static RX: StaticCell<SharedRx> = StaticCell::new();
+    let rx: &'static SharedRx = RX.init(Mutex::new(rx));
+
+    // Shared node-ID bitmap. Empty at boot.
     static NODES: StaticCell<SharedNodes> = StaticCell::new();
-    let nodes: &'static SharedNodes = NODES.init(Mutex::new(initial_nodes));
+    let nodes: &'static SharedNodes = NODES.init(Mutex::new(NodeBitmap::empty()));
 
-    // CSMA/CA backoff state, used by transmit_on_phy before each frame.
+    // CSMA/CA backoff state.
     static BACKOFF: StaticCell<SharedBackoff> = StaticCell::new();
     let backoff: &'static SharedBackoff =
         BACKOFF.init(Mutex::new(BackoffState::new()));
 
-    // ── USB ───────────────────────────────────────────────────────────
+    // ── USB ──────────────────────────────────────────────────────────
     let driver = Driver::new(p.USB, Irqs);
     let (usb_run, data_cdc, debug_cdc) = usb_dev::build(driver, p.FLASH);
 
-    // USB event pump — never returns.
     unwrap!(spawner.spawn(usb_run_task(usb_run)));
 
-    // Debug CDC: banner, echo, log lines, command shell.
-    unwrap!(spawner.spawn(debug::run(debug_cdc, lt_tx, lt_dialog_tx, lt_rx, lt_de, backoff)));
+    // Debug CDC: banner, echo, log lines, debug shell.
+    unwrap!(spawner.spawn(debug::run(debug_cdc, tx_data, tx_enable, backoff)));
 
     // Data CDC: host command parser + LocalTalk→host frame forwarding.
-    unwrap!(spawner.spawn(host::run(data_cdc, lt_tx, lt_dialog_tx, lt_de, nodes, backoff)));
+    unwrap!(spawner.spawn(host::run(data_cdc, tx_data, tx_enable, nodes, backoff)));
 
-    // Continuous LocalTalk receiver + autoresponder. Small ping-pong DMA
-    // buffers keep wire→CTS latency inside LLAP's response window; the
-    // autonomous ACK/CTS is transmitted inline on this task.
-    unwrap!(spawner.spawn(lt_rx_task::run(
-        lt_rx,
-        lt_tx,
-        lt_de,
-        nodes,
-        embassy_rp::Peripheral::into_ref(p.DMA_CH0),
-    )));
+    // Continuous LocalTalk receiver + autoresponder.
+    unwrap!(spawner.spawn(localtalk::rx::run(rx, tx_data, nodes)));
 }
 
 #[embassy_executor::task]

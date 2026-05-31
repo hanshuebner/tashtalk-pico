@@ -24,5 +24,8 @@ pub mod bitstuff;
 pub mod codec;
 pub mod crc;
 pub mod fm0;
+pub mod hdlc;
 pub mod llap;
 pub mod nodemap;
+pub mod pio_programs;
+pub mod pio_sim;
