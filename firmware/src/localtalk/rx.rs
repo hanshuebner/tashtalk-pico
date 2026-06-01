@@ -5,7 +5,7 @@
 //! frames, and dispatches auto-replies (CTS/ACK) and inbound frames.
 
 use crate::host::try_forward_inbound;
-use crate::{SharedNodes, SharedTxData};
+use crate::{SharedNodes, SharedTxData, SharedTxEnable};
 use embassy_time::Timer;
 use tashtalk_proto::bitstuff::{BitUnstuffer, UnstuffEvent};
 use tashtalk_proto::codec::FrameStatus;
@@ -28,6 +28,7 @@ enum Fm0State {
 pub async fn run(
     rx: &'static crate::SharedRx,
     tx_data: &'static SharedTxData,
+    tx_enable: &'static SharedTxEnable,
     nodes: &'static SharedNodes,
 ) -> ! {
     crate::tt_log!("LT_RX: task starting (edge timer)");
@@ -115,7 +116,8 @@ pub async fn run(
                                 // Transmit auto-reply immediately if needed.
                                 if let Some(rf) = reply {
                                     let mut txd = tx_data.lock().await;
-                                    tx::transmit_immediate(&mut txd, &rf).await;
+                                    let mut txe = tx_enable.lock().await;
+                                    tx::transmit_immediate(&mut txd, &mut txe, &rf).await;
                                 }
                             }
                         }

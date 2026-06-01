@@ -239,8 +239,8 @@ fn tx_buffer_round_trip() {
 
     // The sync prefix (6 half-cells) is don't-care on the wire when
     // TX_EN is gated. Skip it and decode just the frame portion.
-    let sync_len = 6; // SYNC_ON + SYNC_OFF
-    let frame_symbols = &buf[sync_len..];
+    use tashtalk_proto::hdlc::SM1_PRE_FRAME_CYCLES;
+    let frame_symbols = &buf[SM1_PRE_FRAME_CYCLES..];
     assert_eq!(frame_symbols.len(), frame_hc as usize);
 
     let wire = simulate_wire(frame_symbols, 4);

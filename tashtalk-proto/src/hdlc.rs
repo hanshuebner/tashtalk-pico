@@ -111,18 +111,21 @@ use crate::fm0::{Fm0Encoder, MAX_FM0_SYMBOLS};
 /// FM-0 encoded symbol buffer, ready for PIO shift-out.
 pub type Fm0Buffer = Vec<u8, MAX_FM0_SYMBOLS>;
 
-/// Number of half-cells for the sync pulse ON phase (1 bit time = 2 half-cells).
-const SYNC_ON_HALFCELLS: usize = 2;
-
-/// Number of half-cells for the sync pulse silence (2 bit times = 4 half-cells).
-const SYNC_OFF_HALFCELLS: usize = 4;
+/// Total SM1 PIO cycles before frame_hold begins. SM0 shifts one
+/// half-cell per cycle, so the SM0 buffer needs this many don't-care
+/// half-cells before the real frame data.
+///
+/// SM1 phase 1 (sync):    set pins 1 + set x 0 + jmp x--         = 3
+/// SM1 phase 2 (silence): set pins 0 + set x 3 + 4× jmp x--     = 6
+/// SM1 phase 3 (setup):   set pins 1 + pull block + mov x osr    = 3
+/// Total: 12 cycles
+pub const SM1_PRE_FRAME_CYCLES: usize = 12;
 
 /// Build a PIO-ready FM-0 symbol buffer for a CSMA/CA transmission.
 ///
 /// The output includes:
-/// 1. Sync pulse region: `SYNC_ON_HALFCELLS` of don't-care data
-///    (TX_EN controls whether this appears on the wire) followed by
-///    `SYNC_OFF_HALFCELLS` of don't-care silence.
+/// 1. `SM1_PRE_FRAME_CYCLES` don't-care half-cells (SM1 handles
+///    sync pulse + silence timing during this period).
 /// 2. The HDLC frame FM-0 encoded: flags + bit-stuffed payload+CRC +
 ///    closing flag + abort.
 ///
@@ -140,14 +143,9 @@ pub fn build_tx_buffer(frame: &[u8]) -> Option<(Fm0Buffer, u32)> {
     let mut fm0 = Fm0Buffer::new();
     let mut enc = Fm0Encoder::new();
 
-    // Phase 1: Sync pulse ON (content doesn't matter, TX_EN gates it).
-    // Encode arbitrary bits so the encoder state advances consistently.
-    for _ in 0..SYNC_ON_HALFCELLS {
-        let _ = fm0.push(0);
-    }
-
-    // Phase 2: Sync pulse silence (TX disabled, content doesn't matter).
-    for _ in 0..SYNC_OFF_HALFCELLS {
+    // Don't-care padding: SM1 consumes SM1_PRE_FRAME_CYCLES before
+    // enabling DE for the frame. SM0 shifts these into the disabled driver.
+    for _ in 0..SM1_PRE_FRAME_CYCLES {
         let _ = fm0.push(0);
     }
 
@@ -188,18 +186,9 @@ pub fn build_immediate_tx_buffer(frame: &[u8]) -> Option<Fm0Buffer> {
 
 /// Build the TX Enable SM command sequence for a CSMA/CA transmission.
 ///
-/// Returns an array of `(duration_halfcells, pin_value)` pairs:
-/// 1. `(SYNC_ON, 1)` — enable for sync pulse
-/// 2. `(SYNC_OFF, 0)` — disable for silence
-/// 3. `(frame_halfcells, 1)` — enable for frame
-/// 4. `(0, 0)` — disable after frame
-pub fn build_tx_enable_sequence(frame_halfcells: u32) -> [(u32, u8); 4] {
-    [
-        (SYNC_ON_HALFCELLS as u32, 1),
-        (SYNC_OFF_HALFCELLS as u32, 0),
-        (frame_halfcells, 1),
-        (0, 0),
-    ]
+/// Returns `(pre_frame_cycles, frame_halfcells)` for SM1 configuration.
+pub fn build_tx_enable_sequence(frame_halfcells: u32) -> (u32, u32) {
+    (SM1_PRE_FRAME_CYCLES as u32, frame_halfcells)
 }
 
 #[cfg(test)]
@@ -363,43 +352,33 @@ mod tests {
     // ── TX pipeline tests ─────────────────────────────────────────────
 
     #[test]
-    fn tx_buffer_has_sync_prefix() {
+    fn tx_buffer_has_padding_prefix() {
         let frame = [0x42, 0x01, 0x81];
         let (buf, _) = build_tx_buffer(&frame).unwrap();
-
-        // First SYNC_ON_HALFCELLS + SYNC_OFF_HALFCELLS = 6 symbols
-        // are the sync pulse region.
-        assert!(buf.len() > SYNC_ON_HALFCELLS + SYNC_OFF_HALFCELLS);
+        assert!(buf.len() > SM1_PRE_FRAME_CYCLES);
     }
 
     #[test]
     fn tx_buffer_frame_halfcells_matches() {
         let frame = [0x42, 0x01, 0x81];
         let (buf, frame_hc) = build_tx_buffer(&frame).unwrap();
-
-        let total_sync = SYNC_ON_HALFCELLS + SYNC_OFF_HALFCELLS;
-        let expected_frame_hc = buf.len() - total_sync;
+        let expected_frame_hc = buf.len() - SM1_PRE_FRAME_CYCLES;
         assert_eq!(frame_hc as usize, expected_frame_hc);
     }
 
     #[test]
     fn tx_enable_sequence_structure() {
-        let seq = build_tx_enable_sequence(200);
-        assert_eq!(seq[0], (SYNC_ON_HALFCELLS as u32, 1));  // sync ON
-        assert_eq!(seq[1], (SYNC_OFF_HALFCELLS as u32, 0)); // silence
-        assert_eq!(seq[2], (200, 1));                        // frame
-        assert_eq!(seq[3], (0, 0));                          // disable
+        let (pre, frame) = build_tx_enable_sequence(200);
+        assert_eq!(pre, SM1_PRE_FRAME_CYCLES as u32);
+        assert_eq!(frame, 200);
     }
 
     #[test]
-    fn immediate_tx_buffer_has_no_sync() {
+    fn immediate_tx_buffer_has_no_padding() {
         let frame = [0x42, 0x01, 0x81];
         let imm = build_immediate_tx_buffer(&frame).unwrap();
         let (full, _) = build_tx_buffer(&frame).unwrap();
-
-        // Immediate buffer should be shorter by the sync region.
-        let sync_size = SYNC_ON_HALFCELLS + SYNC_OFF_HALFCELLS;
-        assert_eq!(imm.len() + sync_size, full.len());
+        assert_eq!(imm.len() + SM1_PRE_FRAME_CYCLES, full.len());
     }
 
     #[test]

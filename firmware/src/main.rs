@@ -167,7 +167,7 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(host::run(data_cdc, tx_data, tx_enable, nodes, backoff)));
 
     // Continuous LocalTalk receiver + autoresponder.
-    unwrap!(spawner.spawn(localtalk::rx::run(rx, tx_data, nodes)));
+    unwrap!(spawner.spawn(localtalk::rx::run(rx, tx_data, tx_enable, nodes)));
 }
 
 #[embassy_executor::task]

@@ -1,8 +1,6 @@
 //! PIO initialization and low-level PHY access.
-//!
-//! Loads the three PIO programs, configures clock dividers and pin
-//! mappings, and provides the TX/RX handles used by the async tasks.
 
+use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, PIO1};
 use embassy_rp::pio::{
     Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig, ShiftDirection,
@@ -28,14 +26,17 @@ const fn clock_div(target_hz: u32) -> U24F8 {
     U24F8::from_bits(div_x256 as u32)
 }
 
+/// TX data shift-out (PIO0 SM0).
 pub struct LtTxData<'d> {
     pub sm: StateMachine<'d, PIO0, 0>,
 }
 
+/// TX driver enable (GPIO output, directly driven by software).
 pub struct LtTxEnable<'d> {
-    pub sm: StateMachine<'d, PIO0, 1>,
+    pub de: Output<'d>,
 }
 
+/// RX edge timer + carrier sense (PIO1 SM0).
 pub struct LtRx<'d> {
     pub sm: StateMachine<'d, PIO1, 0>,
 }
@@ -46,20 +47,18 @@ pub fn init_phy<'d>(
     pio1: impl Peripheral<P = PIO1> + 'd,
     _pio1_irqs: Pio1Irqs,
     tx_data_pin: impl Peripheral<P = impl PioPin> + 'd,
-    tx_en_pin: impl Peripheral<P = impl PioPin> + 'd,
+    tx_en_pin: impl Peripheral<P = impl embassy_rp::gpio::Pin> + 'd,
     rx_data_pin: impl Peripheral<P = impl PioPin> + 'd,
     carrier_sense_pin: impl Peripheral<P = impl PioPin> + 'd,
 ) -> (LtTxData<'d>, LtTxEnable<'d>, LtRx<'d>) {
-    // ── PIO0: SM0 (TX Data) + SM1 (TX Enable) ──────────────────────
+    // ── PIO0: SM0 (TX Data Shift-out) ──────────────────────────────
 
     let Pio {
         mut common,
         mut sm0,
-        mut sm1,
         ..
     } = Pio::new(pio0, Pio0Irqs {});
 
-    // SM0: TX Data Shift-out
     let tx_data_prog = pio_proc::pio_asm!(
         ".wrap_target",
         "    out pins, 1",
@@ -81,55 +80,14 @@ pub fn init_phy<'d>(
     sm0.set_config(&tx_data_cfg);
     sm0.set_pin_dirs(Direction::Out, &[&tx_data_pin_obj]);
 
-    // SM1: TX Enable + Collision Gate
-    let tx_en_prog = pio_proc::pio_asm!(
-        // Phase 1: Sync pulse (2 half-cells = 1 bit time)
-        "    set pins, 1",
-        "    set x, 0",
-        "    jmp x--, silence",
-
-        // Phase 2: Silence (4 half-cells, check carrier sense)
-        "silence:",
-        "    set pins, 0",
-        "    set x, 3",
-        "silence_check:",
-        "    jmp pin, collision",
-        "    jmp x--, silence_check",
-
-        // Phase 3: Frame
-        "    set pins, 1",
-        "    pull block",
-        "    mov x, osr",
-        "frame_hold:",
-        "    jmp x--, frame_hold",
-
-        // Phase 4: Done
-        "    set pins, 0",
-        "    irq set 1",
-        "halt_ok:",
-        "    jmp halt_ok",
-
-        // Collision path
-        "collision:",
-        "    set pins, 0",
-        "    irq set 2",
-        "halt_col:",
-        "    jmp halt_col",
-    );
-    let tx_en_loaded = common.load_program(&tx_en_prog.program);
-    let tx_en_pin_obj = common.make_pio_pin(tx_en_pin);
-
-    let mut tx_en_cfg = Config::default();
-    tx_en_cfg.use_program(&tx_en_loaded, &[]);
-    tx_en_cfg.set_set_pins(&[&tx_en_pin_obj]);
-    tx_en_cfg.clock_divider = clock_div(TX_CLOCK_HZ);
-    sm1.set_config(&tx_en_cfg);
-    sm1.set_pin_dirs(Direction::Out, &[&tx_en_pin_obj]);
-
-    // SM1 JMP PIN reads GP5 (carrier sense from SM2).
-    embassy_rp::pac::PIO0.sm(1).execctrl().modify(|w| {
-        w.set_jmp_pin(5);
-    });
+    // ── GP3: TX Driver Enable (GPIO, not PIO) ──────────────────────
+    //
+    // DE is driven directly by software. Using PIO for DE would
+    // require switching the GPIO function select between PIO (for
+    // CSMA sync pulse) and SIO (for immediate TX), which is fragile.
+    // Software-driven DE is simpler and the timing is adequate — the
+    // sync pulse only needs ~bit-time precision, not cycle-level.
+    let de = Output::new(tx_en_pin, Level::Low);
 
     // ── PIO1: SM0 (RX Edge Timer + Carrier Sense) ──────────────────
 
@@ -197,7 +155,7 @@ pub fn init_phy<'d>(
 
     (
         LtTxData { sm: sm0 },
-        LtTxEnable { sm: sm1 },
+        LtTxEnable { de },
         LtRx { sm: rx_sm },
     )
 }
