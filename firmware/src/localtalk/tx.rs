@@ -15,6 +15,7 @@ use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::StateMachine;
 use embassy_time::{Duration, Instant, Timer};
 use tashtalk_proto::backoff::BackoffState;
+use tashtalk_proto::codec::MAX_FRAME_LEN;
 use tashtalk_proto::hdlc::{build_immediate_tx_buffer, build_tx_buffer, Fm0Buffer};
 
 use super::phy::{LtTxData, LtTxEnable};
@@ -126,17 +127,18 @@ async fn do_tx(
     tx_enable.de.set_level(Level::Low);
 }
 
-/// Transmit a frame using CSMA/CA.
-pub async fn transmit_csma(
-    tx_data: &mut LtTxData<'_>,
-    tx_enable: &mut LtTxEnable<'_>,
+/// Wait for bus idle + CSMA/CA backoff. Returns `false` if the frame
+/// is invalid. Call this BEFORE acquiring the TX lock so that
+/// auto-reply CTS/ACK frames from the RX task aren't blocked during
+/// the (potentially long) CSMA wait.
+pub async fn csma_wait(
     backoff: &mut BackoffState,
     frame: &[u8],
 ) -> bool {
-    let Some((fm0_buf, _frame_halfcells)) = build_tx_buffer(frame) else {
+    if frame.len() < 5 || frame.len() > MAX_FRAME_LEN {
         warn!("TX: invalid frame");
         return false;
-    };
+    }
 
     backoff.prep_for_next_frame();
 
@@ -148,8 +150,20 @@ pub async fn transmit_csma(
     let delay_us = delay_units as u64 * 100;
     wait_idle_for(delay_us).await;
 
-    do_tx(tx_data, tx_enable, &fm0_buf).await;
     true
+}
+
+/// Build FM-0 and transmit. Called after csma_wait, with TX locks held.
+pub async fn transmit_frame(
+    tx_data: &mut LtTxData<'_>,
+    tx_enable: &mut LtTxEnable<'_>,
+    frame: &[u8],
+) {
+    let Some(fm0_buf) = build_tx_buffer(frame) else {
+        warn!("TX: build failed");
+        return;
+    };
+    do_tx(tx_data, tx_enable, &fm0_buf).await;
 }
 
 /// Transmit a frame immediately (no CSMA/CA).

@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the complete hardware path using the PIO simulator:
 //!
-//! 1. Build LLAP frame → HDLC bitstream → FM-0 encode
+//! 1. Build LLAP frame (with CRC) → HDLC bitstream → FM-0 encode
 //! 2. Feed FM-0 symbols through SM0 (TX shift-out) simulator
 //! 3. Feed SM0's output through SM2 (RX edge timer) simulator
 //! 4. Decode SM2's FIFO output (interval counts) → FM-0 decode → HDLC
@@ -25,18 +25,18 @@ use tashtalk_proto::pio_sim::PioSim;
 /// Each SM0 half-cell = 20 SM2 cycles.
 const RX_CYCLES_PER_HALFCELL: usize = 20;
 
-/// Feed an LLAP frame through the full PIO pipeline and recover it.
-///
-/// Steps:
-/// 1. HDLC-frame the input (flags + bit-stuff + CRC + flag + abort)
-/// 2. FM-0 encode to half-cell symbols
-/// 3. Feed through SM0 (TX shift-out) to get output pin trace
-/// 4. Stretch SM0 output to SM2's clock rate
-/// 5. Feed through SM2 (RX edge timer) to get interval counts
-/// 6. Decode intervals → FM-0 bits → HDLC bytes → frame
-fn pio_round_trip(frame: &[u8]) -> Vec<Vec<u8>> {
+/// Build a frame with CRC from a header slice.
+fn with_crc(header: &[u8]) -> Vec<u8> {
+    let crc = lt_crc(header);
+    let mut frame = header.to_vec();
+    frame.extend_from_slice(&crc);
+    frame
+}
+
+/// Feed an LLAP frame (WITH CRC) through the full PIO pipeline and recover it.
+fn pio_round_trip(frame_with_crc: &[u8]) -> Vec<Vec<u8>> {
     // Step 1-2: HDLC frame + FM-0 encode
-    let hdlc_bits = build_hdlc_bitstream(frame).expect("valid frame");
+    let hdlc_bits = build_hdlc_bitstream(frame_with_crc).expect("valid frame");
     let mut enc = Fm0Encoder::new();
     let mut fm0_symbols: Vec<u8> = Vec::new();
     for &bit in hdlc_bits.iter() {
@@ -124,13 +124,6 @@ fn pio_round_trip(frame: &[u8]) -> Vec<Vec<u8>> {
 fn decode_fifo_intervals(fifo: &[u32]) -> Vec<u32> {
     let mut intervals = Vec::new();
     for &word in fifo {
-        // Each word may contain multiple 5-bit values packed by autopush.
-        // With autopush_threshold=5, each word contains exactly one 5-bit value
-        // in the low 5 bits (ISR shifts left, so the value ends up shifted).
-        // Actually, with autopush at 5 bits, each push contains the 5 bits
-        // that were shifted in. Since `in x, 5` shifts X's low 5 bits into ISR
-        // from the right (ISR <<= 5, ISR |= (X & 0x1F)), and autopush fires
-        // after 5 bits, each FIFO word has the interval in bits [4:0].
         let val = word & 0x1F;
         intervals.push(val);
     }
@@ -138,46 +131,30 @@ fn decode_fifo_intervals(fifo: &[u32]) -> Vec<u32> {
 }
 
 /// Convert edge intervals (remaining counter values) to FM-0 decoded bits.
-///
-/// Each interval is the remaining counter value when the edge was detected.
-/// Elapsed = 31 - remaining. At 20 SM2 cycles per half-cell:
-/// - Half-cell (T/2): elapsed ≈ 10 → remaining ≈ 21
-/// - Full cell (T): elapsed ≈ 20 → remaining ≈ 11
-/// - Timeout: remaining = 0 (from `in null, 5`)
-///
-/// Threshold: remaining > 16 → short (T/2), remaining ≤ 16 → long (T).
 fn intervals_to_fm0_bits(intervals: &[u32]) -> Vec<u8> {
     let mut bits = Vec::new();
     let mut state = FmState::Boundary;
 
     for &remaining in intervals {
         if remaining == 0 {
-            // Timeout — idle gap. Could signal end of frame.
             continue;
         }
 
         let elapsed = 31_u32.saturating_sub(remaining);
-        // With 20 cycles per half-cell, short ≈ 10, long ≈ 20.
-        // But the counting loop is 2 cycles per iteration, so
-        // actual elapsed iterations ≈ 10 for T/2 and 20 for T.
         let is_short = elapsed < 15;
 
         match state {
             FmState::Boundary => {
                 if is_short {
-                    // Short interval: boundary to mid-cell of a '0' bit
                     bits.push(0);
                     state = FmState::MidCell;
                 } else {
-                    // Long interval: full cell → '1' bit
                     bits.push(1);
                     state = FmState::Boundary;
                 }
             }
             FmState::MidCell => {
-                // Should be short (mid-cell to next boundary)
                 state = FmState::Boundary;
-                // Don't emit a bit — the '0' was already emitted
             }
         }
     }
@@ -224,20 +201,18 @@ fn bits_to_frames(bits: &[u8]) -> Vec<Vec<u8>> {
 
 #[test]
 fn pio_round_trip_enq() {
-    let frame = [0x42u8, 0x01, 0x81]; // ENQ
-    let crc = lt_crc(&frame);
-    let expected: Vec<u8> = frame.iter().chain(crc.iter()).copied().collect();
+    let frame = with_crc(&[0x42u8, 0x01, 0x81]);
 
     let recovered = pio_round_trip(&frame);
     assert_eq!(recovered.len(), 1, "expected 1 frame, got {}", recovered.len());
-    assert_eq!(recovered[0], expected);
+    assert_eq!(recovered[0], frame);
     assert!(frame_crc_ok(&recovered[0]));
 }
 
 #[test]
 fn pio_round_trip_ack() {
-    let ack = compose_ack(0x42);
-    let recovered = pio_round_trip(&ack[..3]);
+    let ack = compose_ack(0x42); // already includes CRC
+    let recovered = pio_round_trip(&ack);
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0], ack.to_vec());
     assert!(frame_crc_ok(&recovered[0]));
@@ -245,54 +220,47 @@ fn pio_round_trip_ack() {
 
 #[test]
 fn pio_round_trip_rts_cts() {
-    let rts = compose_rts(0x10, 0x42);
-    let recovered_rts = pio_round_trip(&rts[..3]);
+    let rts = compose_rts(0x10, 0x42); // includes CRC
+    let recovered_rts = pio_round_trip(&rts);
     assert_eq!(recovered_rts.len(), 1);
     assert_eq!(recovered_rts[0], rts.to_vec());
 
-    let cts = compose_cts(0x42, 0x10);
-    let recovered_cts = pio_round_trip(&cts[..3]);
+    let cts = compose_cts(0x42, 0x10); // includes CRC
+    let recovered_cts = pio_round_trip(&cts);
     assert_eq!(recovered_cts.len(), 1);
     assert_eq!(recovered_cts[0], cts.to_vec());
 }
 
 #[test]
 fn pio_round_trip_data_frame() {
-    let mut frame = vec![0u8; 15];
-    frame[0] = 0xFF;
-    frame[1] = 0x42;
-    frame[2] = 0x02;
+    let mut header = vec![0u8; 15];
+    header[0] = 0xFF;
+    header[1] = 0x42;
+    header[2] = 0x02;
     for i in 3..15 {
-        frame[i] = (i * 13) as u8;
+        header[i] = (i * 13) as u8;
     }
-
-    let crc = lt_crc(&frame);
-    let mut expected = frame.clone();
-    expected.extend_from_slice(&crc);
+    let frame = with_crc(&header);
 
     let recovered = pio_round_trip(&frame);
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0], expected);
+    assert_eq!(recovered[0], frame);
     assert!(frame_crc_ok(&recovered[0]));
 }
 
 #[test]
 fn pio_round_trip_all_ff() {
-    let frame = [0xFF, 0x42, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
-    let crc = lt_crc(&frame);
-    let mut expected: Vec<u8> = frame.to_vec();
-    expected.extend_from_slice(&crc);
+    let frame = with_crc(&[0xFF, 0x42, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
 
     let recovered = pio_round_trip(&frame);
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0], expected);
+    assert_eq!(recovered[0], frame);
     assert!(frame_crc_ok(&recovered[0]));
 }
 
 #[test]
 fn sm0_output_matches_fm0_encoder() {
-    // Verify SM0 produces bit-identical output to the software FM-0 encoder.
-    let frame = [0x42u8, 0x01, 0x81];
+    let frame = with_crc(&[0x42u8, 0x01, 0x81]);
     let hdlc_bits = build_hdlc_bitstream(&frame).unwrap();
     let mut enc = Fm0Encoder::new();
     let mut expected_symbols: Vec<u8> = Vec::new();
@@ -327,8 +295,6 @@ fn sm0_output_matches_fm0_encoder() {
 
 #[test]
 fn sm2_carrier_sense_tracks_activity() {
-    // Verify SM2 sets carrier sense HIGH when edges are detected
-    // and LOW during idle periods.
     let rx_prog = assemble_rx_edge_timer();
     let mut sim = PioSim::from_program(&rx_prog);
     sim.autopush_threshold = 5;

@@ -103,11 +103,14 @@ pub async fn run(
                                 };
                                 try_forward_inbound(frame, status);
 
+                                let d = if frame.len() >= 1 { frame[0] } else { 0 };
+                                let s = if frame.len() >= 2 { frame[1] } else { 0 };
                                 let t = if frame.len() >= 3 { frame[2] } else { 0xFF };
-                                if frames_seen % 50 == 0 || t >= 0x80 {
+                                if frames_seen % 50 == 0 || t >= 0x80 || reply.is_some() {
                                     crate::tt_log!(
-                                        "LT_RX: #{} t={:02x} crc={} len={}",
-                                        frames_seen, t, crc_ok, frame.len()
+                                        "RX #{} {:02x}->{:02x} t={:02x} crc={} len={} ar={}",
+                                        frames_seen, s, d, t, crc_ok, frame.len(),
+                                        reply.is_some()
                                     );
                                 }
 

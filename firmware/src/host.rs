@@ -120,33 +120,28 @@ pub async fn run(
 
 /// Drive one host-originated frame out the LocalTalk PHY after CSMA.
 ///
-/// Directed data frames use RTS/CTS handshake. Broadcast and control
-/// frames are sent directly.
+/// CSMA wait is done with only the backoff lock held. The TX data/enable
+/// locks are acquired only for the brief actual transmission, so that
+/// the RX task's auto-reply CTS/ACK can proceed without being blocked
+/// during the (potentially long) CSMA idle wait.
 async fn transmit_on_phy(
     tx_data: &'static SharedTxData,
     tx_enable: &'static SharedTxEnable,
     backoff: &'static SharedBackoff,
     frame: &[u8],
 ) {
-    let is_directed_data =
-        frame.len() >= 3 && frame[2] < 0x80 && frame[0] != 0xFF;
+    // Phase 1: CSMA wait (only backoff lock held — TX is free for auto-replies).
+    let ok = {
+        let mut bo = backoff.lock().await;
+        tx::csma_wait(&mut bo, frame).await
+    };
 
+    if !ok { return; }
+
+    // Phase 2: Actual transmission (TX locks held only briefly).
     let mut txd = tx_data.lock().await;
     let mut txe = tx_enable.lock().await;
-    let mut bo = backoff.lock().await;
-
-    if is_directed_data {
-        // For directed data: send RTS via CSMA, then wait for CTS,
-        // then send data immediately.
-        // TODO: implement full RTS/CTS dialog. For now, just CSMA transmit.
-        if !tx::transmit_csma(&mut txd, &mut txe, &mut bo, frame).await {
-            tt_log!("TX: CSMA failed after retries");
-        }
-    } else {
-        if !tx::transmit_csma(&mut txd, &mut txe, &mut bo, frame).await {
-            tt_log!("TX: CSMA failed after retries");
-        }
-    }
+    tx::transmit_frame(&mut txd, &mut txe, frame).await;
 }
 
 async fn write_chunked(cdc: &mut Cdc, data: &[u8]) -> Result<(), EndpointError> {

@@ -1,7 +1,7 @@
 //! Full round-trip integration tests for the LocalTalk TX/RX pipeline.
 //!
 //! These tests exercise the complete path:
-//!   LLAP frame → HDLC framing → FM-0 encode → (simulated wire) →
+//!   LLAP frame (with CRC) → HDLC framing → FM-0 encode → (simulated wire) →
 //!   FM-0 decode → HDLC deframe → verify original LLAP frame
 //!
 //! The "simulated wire" stretches each FM-0 half-cell symbol into N
@@ -14,6 +14,14 @@ use tashtalk_proto::hdlc::{build_hdlc_bitstream, build_immediate_tx_buffer, buil
 use tashtalk_proto::llap::{
     compose_ack, compose_cts, compose_rts, frame_crc_ok, FrameAssembler, AsmEvent,
 };
+
+/// Build a frame with CRC from a header slice.
+fn with_crc(header: &[u8]) -> Vec<u8> {
+    let crc = lt_crc(header);
+    let mut frame = header.to_vec();
+    frame.extend_from_slice(&crc);
+    frame
+}
 
 /// Simulate the wire: stretch FM-0 half-cell symbols to `samples_per_half`
 /// samples each, prepend idle, append trailing edge + idle.
@@ -67,10 +75,10 @@ fn decode_wire(wire: &[u8]) -> Vec<Vec<u8>> {
     frames
 }
 
-/// Full round-trip helper: build HDLC bitstream, FM-0 encode, simulate
-/// wire, decode, return recovered frames.
-fn round_trip(frame: &[u8], samples_per_half: usize) -> Vec<Vec<u8>> {
-    let hdlc_bits = build_hdlc_bitstream(frame).expect("valid frame");
+/// Full round-trip helper: build HDLC bitstream from a frame WITH CRC,
+/// FM-0 encode, simulate wire, decode, return recovered frames.
+fn round_trip(frame_with_crc: &[u8], samples_per_half: usize) -> Vec<Vec<u8>> {
+    let hdlc_bits = build_hdlc_bitstream(frame_with_crc).expect("valid frame");
 
     // FM-0 encode the HDLC bitstream.
     let mut enc = Fm0Encoder::new();
@@ -89,22 +97,18 @@ fn round_trip(frame: &[u8], samples_per_half: usize) -> Vec<Vec<u8>> {
 
 #[test]
 fn round_trip_enq_frame() {
-    let frame = [0x42u8, 0x01, 0x81]; // ENQ
-    let crc = lt_crc(&frame);
-    let full_frame: Vec<u8> = frame.iter().chain(crc.iter()).copied().collect();
+    let frame = with_crc(&[0x42u8, 0x01, 0x81]); // ENQ
 
     let recovered = round_trip(&frame, 4);
     assert_eq!(recovered.len(), 1, "expected 1 frame, got {:?}", recovered);
-    assert_eq!(recovered[0], full_frame);
+    assert_eq!(recovered[0], frame);
     assert!(frame_crc_ok(&recovered[0]));
 }
 
 #[test]
 fn round_trip_ack_frame() {
-    let ack = compose_ack(0x42);
-    // compose_ack includes CRC, so pass the header-only part to build_hdlc.
-    let frame = &ack[..3];
-    let recovered = round_trip(frame, 4);
+    let ack = compose_ack(0x42); // already includes CRC
+    let recovered = round_trip(&ack, 4);
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0], ack.to_vec());
     assert!(frame_crc_ok(&recovered[0]));
@@ -113,7 +117,7 @@ fn round_trip_ack_frame() {
 #[test]
 fn round_trip_rts_frame() {
     let rts = compose_rts(0x10, 0x42);
-    let recovered = round_trip(&rts[..3], 4);
+    let recovered = round_trip(&rts, 4);
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0], rts.to_vec());
     assert!(frame_crc_ok(&recovered[0]));
@@ -122,7 +126,7 @@ fn round_trip_rts_frame() {
 #[test]
 fn round_trip_cts_frame() {
     let cts = compose_cts(0x42, 0x10);
-    let recovered = round_trip(&cts[..3], 4);
+    let recovered = round_trip(&cts, 4);
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0], cts.to_vec());
     assert!(frame_crc_ok(&recovered[0]));
@@ -130,76 +134,63 @@ fn round_trip_cts_frame() {
 
 #[test]
 fn round_trip_data_frame() {
-    let mut frame = vec![0u8; 20];
-    frame[0] = 0xFF; // broadcast
-    frame[1] = 0x42;
-    frame[2] = 0x01; // DDP short
+    let mut header = vec![0u8; 20];
+    header[0] = 0xFF; // broadcast
+    header[1] = 0x42;
+    header[2] = 0x01; // DDP short
     for i in 3..20 {
-        frame[i] = i as u8;
+        header[i] = i as u8;
     }
-
-    let crc = lt_crc(&frame);
-    let mut expected = frame.clone();
-    expected.extend_from_slice(&crc);
+    let frame = with_crc(&header);
 
     let recovered = round_trip(&frame, 4);
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0], expected);
+    assert_eq!(recovered[0], frame);
     assert!(frame_crc_ok(&recovered[0]));
 }
 
 #[test]
 fn round_trip_max_control_types() {
-    // Test all four control frame types.
     for (dest, src, ltype, label) in [
         (0x42, 0x01, 0x81u8, "ENQ"),
         (0x42, 0x42, 0x82, "ACK"),
         (0x10, 0x42, 0x84, "RTS"),
         (0x42, 0x10, 0x85, "CTS"),
     ] {
-        let frame = [dest, src, ltype];
-        let crc = lt_crc(&frame);
-        let expected: Vec<u8> = frame.iter().chain(crc.iter()).copied().collect();
+        let frame = with_crc(&[dest, src, ltype]);
 
         let recovered = round_trip(&frame, 4);
         assert_eq!(recovered.len(), 1, "{label}: wrong frame count");
-        assert_eq!(recovered[0], expected, "{label}: content mismatch");
+        assert_eq!(recovered[0], frame, "{label}: content mismatch");
         assert!(frame_crc_ok(&recovered[0]), "{label}: CRC failed");
     }
 }
 
 #[test]
 fn round_trip_all_ff_data() {
-    // Worst-case bit stuffing: payload of all 0xFF.
-    let mut frame = vec![0xFFu8; 50];
-    frame[0] = 0xFF; // broadcast
-    frame[1] = 0x42;
-    frame[2] = 0x02;
-
-    let crc = lt_crc(&frame);
-    let mut expected = frame.clone();
-    expected.extend_from_slice(&crc);
+    let mut header = vec![0xFFu8; 50];
+    header[0] = 0xFF; // broadcast
+    header[1] = 0x42;
+    header[2] = 0x02;
+    let frame = with_crc(&header);
 
     let recovered = round_trip(&frame, 4);
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0], expected);
+    assert_eq!(recovered[0], frame);
     assert!(frame_crc_ok(&recovered[0]));
 }
 
 #[test]
 fn round_trip_all_zero_data() {
-    let mut frame = vec![0x00u8; 30];
-    frame[0] = 0xFF;
-    frame[1] = 0x42;
-    frame[2] = 0x02;
-
-    let crc = lt_crc(&frame);
-    let mut expected = frame.clone();
-    expected.extend_from_slice(&crc);
+    let mut header = vec![0x00u8; 30];
+    header[0] = 0xFF;
+    header[1] = 0x42;
+    header[2] = 0x02;
+    let frame = with_crc(&header);
 
     let recovered = round_trip(&frame, 4);
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0], expected);
+    assert_eq!(recovered[0], frame);
     assert!(frame_crc_ok(&recovered[0]));
 }
 
@@ -207,54 +198,38 @@ fn round_trip_all_zero_data() {
 
 #[test]
 fn round_trip_slow_clock() {
-    // Sender's clock is slower: 5 samples per half-cell instead of 4.
-    let frame = [0x42u8, 0x01, 0x81];
-    let crc = lt_crc(&frame);
-    let expected: Vec<u8> = frame.iter().chain(crc.iter()).copied().collect();
-
+    let frame = with_crc(&[0x42u8, 0x01, 0x81]);
     let recovered = round_trip(&frame, 5);
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0], expected);
+    assert_eq!(recovered[0], frame);
 }
 
 #[test]
 fn round_trip_fast_clock() {
-    // Sender's clock is faster: 3 samples per half-cell.
-    let frame = [0x42u8, 0x01, 0x81];
-    let crc = lt_crc(&frame);
-    let expected: Vec<u8> = frame.iter().chain(crc.iter()).copied().collect();
-
+    let frame = with_crc(&[0x42u8, 0x01, 0x81]);
     let recovered = round_trip(&frame, 3);
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0], expected);
+    assert_eq!(recovered[0], frame);
 }
 
 // ── TX pipeline tests ─────────────────────────────────────────────────
 
 #[test]
 fn tx_buffer_round_trip() {
-    // Test build_tx_buffer produces a buffer that decodes correctly.
-    let frame = [0x42u8, 0x01, 0x81];
-    let (buf, frame_hc) = build_tx_buffer(&frame).unwrap();
+    let frame = with_crc(&[0x42u8, 0x01, 0x81]);
+    let buf = build_tx_buffer(&frame).unwrap();
 
-    // The sync prefix (6 half-cells) is don't-care on the wire when
-    // TX_EN is gated. Skip it and decode just the frame portion.
-    use tashtalk_proto::hdlc::SM1_PRE_FRAME_CYCLES;
-    let frame_symbols = &buf[SM1_PRE_FRAME_CYCLES..];
-    assert_eq!(frame_symbols.len(), frame_hc as usize);
-
-    let wire = simulate_wire(frame_symbols, 4);
+    let wire = simulate_wire(&buf, 4);
     let recovered = decode_wire(&wire);
     assert_eq!(recovered.len(), 1);
     assert!(frame_crc_ok(&recovered[0]));
-    assert_eq!(&recovered[0][..3], &frame);
+    assert_eq!(recovered[0], frame);
 }
 
 #[test]
 fn immediate_tx_buffer_round_trip() {
-    // Test build_immediate_tx_buffer (no sync pulse).
-    let cts = compose_cts(0x42, 0x10);
-    let buf = build_immediate_tx_buffer(&cts[..3]).unwrap();
+    let cts = compose_cts(0x42, 0x10); // already includes CRC
+    let buf = build_immediate_tx_buffer(&cts).unwrap();
 
     let wire = simulate_wire(&buf, 4);
     let recovered = decode_wire(&wire);
@@ -267,28 +242,23 @@ fn immediate_tx_buffer_round_trip() {
 
 #[test]
 fn rts_cts_data_dialog() {
-    // Simulate a complete directed dialog:
-    // Node A (0x42) sends RTS to node B (0x10)
-    // Node B responds with CTS
-    // Node A sends data frame
-
     let rts = compose_rts(0x10, 0x42);
     let cts = compose_cts(0x42, 0x10);
-    let mut data_frame = vec![0u8; 15];
-    data_frame[0] = 0x10;
-    data_frame[1] = 0x42;
-    data_frame[2] = 0x01;
+    let mut data_header = vec![0u8; 15];
+    data_header[0] = 0x10;
+    data_header[1] = 0x42;
+    data_header[2] = 0x01;
     for i in 3..15 {
-        data_frame[i] = (i * 7) as u8;
+        data_header[i] = (i * 7) as u8;
     }
+    let data_frame = with_crc(&data_header);
 
-    // Verify each frame round-trips independently.
-    let rts_recovered = round_trip(&rts[..3], 4);
+    let rts_recovered = round_trip(&rts, 4);
     assert_eq!(rts_recovered.len(), 1);
     assert!(frame_crc_ok(&rts_recovered[0]));
     assert_eq!(rts_recovered[0][2], 0x84); // RTS type
 
-    let cts_recovered = round_trip(&cts[..3], 4);
+    let cts_recovered = round_trip(&cts, 4);
     assert_eq!(cts_recovered.len(), 1);
     assert!(frame_crc_ok(&cts_recovered[0]));
     assert_eq!(cts_recovered[0][2], 0x85); // CTS type
@@ -296,20 +266,19 @@ fn rts_cts_data_dialog() {
     let data_recovered = round_trip(&data_frame, 4);
     assert_eq!(data_recovered.len(), 1);
     assert!(frame_crc_ok(&data_recovered[0]));
-    assert_eq!(&data_recovered[0][..data_frame.len()], &data_frame[..]);
+    assert_eq!(data_recovered[0], data_frame);
 }
 
 #[test]
 fn enq_ack_dialog() {
-    // Node probing: ENQ from 0x01 to 0x42, ACK back.
-    let enq_frame = [0x42u8, 0x01, 0x81];
+    let enq = with_crc(&[0x42u8, 0x01, 0x81]);
     let ack = compose_ack(0x42);
 
-    let enq_recovered = round_trip(&enq_frame, 4);
+    let enq_recovered = round_trip(&enq, 4);
     assert_eq!(enq_recovered.len(), 1);
     assert!(frame_crc_ok(&enq_recovered[0]));
 
-    let ack_recovered = round_trip(&ack[..3], 4);
+    let ack_recovered = round_trip(&ack, 4);
     assert_eq!(ack_recovered.len(), 1);
     assert!(frame_crc_ok(&ack_recovered[0]));
     assert_eq!(ack_recovered[0], ack.to_vec());
@@ -319,22 +288,17 @@ fn enq_ack_dialog() {
 
 #[test]
 fn round_trip_large_data_frame() {
-    // Near-maximum payload (not quite 600 to keep test fast).
-    let mut frame = vec![0u8; 200];
-    frame[0] = 0x10;
-    frame[1] = 0x42;
-    frame[2] = 0x02;
-    // Fill with varied data to exercise bit-stuffing thoroughly.
+    let mut header = vec![0u8; 200];
+    header[0] = 0x10;
+    header[1] = 0x42;
+    header[2] = 0x02;
     for i in 3..200 {
-        frame[i] = ((i * 37 + 13) & 0xFF) as u8;
+        header[i] = ((i * 37 + 13) & 0xFF) as u8;
     }
-
-    let crc = lt_crc(&frame);
-    let mut expected = frame.clone();
-    expected.extend_from_slice(&crc);
+    let frame = with_crc(&header);
 
     let recovered = round_trip(&frame, 4);
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0], expected);
+    assert_eq!(recovered[0], frame);
     assert!(frame_crc_ok(&recovered[0]));
 }

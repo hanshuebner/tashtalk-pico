@@ -99,16 +99,15 @@ async fn handle_input(
                 write_chunked(cdc, b"\r\n[debug] TX via CSMA/CA\r\n").await?;
                 let frame = debug_test_frame();
                 {
+                    let mut bo = backoff.lock().await;
+                    tx::csma_wait(&mut bo, &frame).await;
+                }
+                {
                     let mut txd = tx_data.lock().await;
                     let mut txe = tx_enable.lock().await;
-                    let mut bo = backoff.lock().await;
-                    let ok = tx::transmit_csma(&mut txd, &mut txe, &mut bo, &frame).await;
-                    if ok {
-                        write_chunked(cdc, b"[debug] TX done\r\n").await?;
-                    } else {
-                        write_chunked(cdc, b"[debug] TX failed (collision)\r\n").await?;
-                    }
+                    tx::transmit_frame(&mut txd, &mut txe, &frame).await;
                 }
+                write_chunked(cdc, b"[debug] TX done\r\n").await?;
             }
             b'b' | b'B' => {
                 write_chunked(cdc, b"\r\n[debug] rebooting to BOOTSEL...\r\n").await?;

@@ -21,7 +21,6 @@ use heapless::Vec;
 
 use crate::bitstuff::FLAG;
 use crate::codec::MAX_FRAME_LEN;
-use crate::crc::CrcCalculator;
 
 /// Number of opening flag bytes.
 const NUM_OPENING_FLAGS: usize = 2;
@@ -44,15 +43,20 @@ pub const MAX_HDLC_BITS: usize = 8192;
 /// Bit vector type for HDLC output.
 pub type HdlcBits = Vec<u8, MAX_HDLC_BITS>;
 
-/// Build a complete HDLC bitstream from an LLAP frame (header + data,
-/// no CRC — CRC is computed and appended here).
+/// Build a complete HDLC bitstream from an LLAP frame that already
+/// includes the trailing 2-byte FCS (CRC-CCITT).
+///
+/// The input `frame` must be the complete LLAP frame WITH CRC appended
+/// (e.g. 5 bytes for a control frame, or header+data+2 CRC for data).
+/// This function does NOT compute or append CRC — it only adds HDLC
+/// framing (flags, bit-stuffing, abort).
 ///
 /// Output: one `u8` per bit (value 0 or 1), LSB-first within each byte
 /// of the original frame. Ready for FM-0 encoding.
 ///
-/// Returns `None` if the frame is too short (< 3 bytes: dest, src, type).
+/// Returns `None` if the frame is too short (< 5 bytes: 3 header + 2 CRC).
 pub fn build_hdlc_bitstream(frame: &[u8]) -> Option<HdlcBits> {
-    if frame.len() < 3 || frame.len() > MAX_FRAME_LEN {
+    if frame.len() < 5 || frame.len() > MAX_FRAME_LEN {
         return None;
     }
 
@@ -63,14 +67,9 @@ pub fn build_hdlc_bitstream(frame: &[u8]) -> Option<HdlcBits> {
         push_byte_as_bits(&mut bits, FLAG);
     }
 
-    // Compute CRC over the raw frame bytes.
-    let mut crc = CrcCalculator::new();
-    crc.feed(frame);
-    let crc_bytes = [crc.byte1(), crc.byte2()];
-
-    // Bit-stuff the payload + CRC.
+    // Bit-stuff the frame bytes (which already include CRC).
     let mut ones: u8 = 0;
-    for &byte in frame.iter().chain(crc_bytes.iter()) {
+    for &byte in frame.iter() {
         for bit_idx in 0..8u8 {
             let bit = (byte >> bit_idx) & 1;
             let _ = bits.push(bit);
@@ -111,54 +110,26 @@ use crate::fm0::{Fm0Encoder, MAX_FM0_SYMBOLS};
 /// FM-0 encoded symbol buffer, ready for PIO shift-out.
 pub type Fm0Buffer = Vec<u8, MAX_FM0_SYMBOLS>;
 
-/// Total SM1 PIO cycles before frame_hold begins. SM0 shifts one
-/// half-cell per cycle, so the SM0 buffer needs this many don't-care
-/// half-cells before the real frame data.
-///
-/// SM1 phase 1 (sync):    set pins 1 + set x 0 + jmp x--         = 3
-/// SM1 phase 2 (silence): set pins 0 + set x 3 + 4× jmp x--     = 6
-/// SM1 phase 3 (setup):   set pins 1 + pull block + mov x osr    = 3
-/// Total: 12 cycles
-pub const SM1_PRE_FRAME_CYCLES: usize = 12;
-
 /// Build a PIO-ready FM-0 symbol buffer for a CSMA/CA transmission.
 ///
-/// The output includes:
-/// 1. `SM1_PRE_FRAME_CYCLES` don't-care half-cells (SM1 handles
-///    sync pulse + silence timing during this period).
-/// 2. The HDLC frame FM-0 encoded: flags + bit-stuffed payload+CRC +
-///    closing flag + abort.
-///
-/// The companion TX Enable SM (SM1) must be loaded with matching
-/// timing commands to gate the RS-422 driver.
-///
-/// Returns `(fm0_symbols, frame_halfcells)` where `frame_halfcells`
-/// is the count of half-cells in the frame portion (for SM1's frame
-/// duration command).
+/// The output is the HDLC frame FM-0 encoded: flags + bit-stuffed
+/// payload+CRC + closing flag + abort. DE is controlled by software
+/// so no padding is needed.
 ///
 /// Returns `None` if the frame is invalid.
-pub fn build_tx_buffer(frame: &[u8]) -> Option<(Fm0Buffer, u32)> {
+pub fn build_tx_buffer(frame: &[u8]) -> Option<Fm0Buffer> {
     let hdlc_bits = build_hdlc_bitstream(frame)?;
 
     let mut fm0 = Fm0Buffer::new();
     let mut enc = Fm0Encoder::new();
 
-    // Don't-care padding: SM1 consumes SM1_PRE_FRAME_CYCLES before
-    // enabling DE for the frame. SM0 shifts these into the disabled driver.
-    for _ in 0..SM1_PRE_FRAME_CYCLES {
-        let _ = fm0.push(0);
-    }
-
-    // Phase 3: HDLC frame, FM-0 encoded.
-    let frame_start = fm0.len();
     for &bit in hdlc_bits.iter() {
         let (a, b) = enc.encode_bit(bit);
         let _ = fm0.push(a);
         let _ = fm0.push(b);
     }
-    let frame_halfcells = (fm0.len() - frame_start) as u32;
 
-    Some((fm0, frame_halfcells))
+    Some(fm0)
 }
 
 /// Build a PIO-ready FM-0 symbol buffer for an immediate transmission
@@ -184,12 +155,6 @@ pub fn build_immediate_tx_buffer(frame: &[u8]) -> Option<Fm0Buffer> {
     Some(fm0)
 }
 
-/// Build the TX Enable SM command sequence for a CSMA/CA transmission.
-///
-/// Returns `(pre_frame_cycles, frame_halfcells)` for SM1 configuration.
-pub fn build_tx_enable_sequence(frame_halfcells: u32) -> (u32, u32) {
-    (SM1_PRE_FRAME_CYCLES as u32, frame_halfcells)
-}
 
 #[cfg(test)]
 mod tests {
@@ -214,14 +179,15 @@ mod tests {
 
     #[test]
     fn basic_control_frame() {
-        // ENQ frame: [dest=0x42, src=0x01, type=0x81]
-        let frame = [0x42u8, 0x01, 0x81];
+        // ENQ frame: [dest=0x42, src=0x01, type=0x81, CRC1, CRC2]
+        let header = [0x42u8, 0x01, 0x81];
+        let crc = lt_crc(&header);
+        let frame = [header[0], header[1], header[2], crc[0], crc[1]];
         let bits = build_hdlc_bitstream(&frame).unwrap();
 
         let events = unstuff_bitstream(&bits);
 
         // Expect: Flag, Flag, 0x42, 0x01, 0x81, CRC1, CRC2, Flag, Abort
-        let crc = lt_crc(&frame);
         assert!(events.len() >= 7, "events: {:?}", events);
         assert_eq!(events[0], UnstuffEvent::Flag);
         assert_eq!(events[1], UnstuffEvent::Flag);
@@ -236,7 +202,9 @@ mod tests {
 
     #[test]
     fn crc_validates_after_unstuff() {
-        let frame = [0x42u8, 0x01, 0x81];
+        let header = [0x42u8, 0x01, 0x81];
+        let crc = lt_crc(&header);
+        let frame = [header[0], header[1], header[2], crc[0], crc[1]];
         let bits = build_hdlc_bitstream(&frame).unwrap();
         let events = unstuff_bitstream(&bits);
 
@@ -250,19 +218,24 @@ mod tests {
             .collect();
 
         // Feed all payload bytes (including CRC) through CRC calculator.
-        let mut crc = crate::crc::CrcCalculator::new();
-        crc.feed(&payload_bytes);
-        assert!(crc.is_ok(), "CRC validation failed, reg=0x{:04X}", crc.reg());
+        let mut crc_calc = crate::crc::CrcCalculator::new();
+        crc_calc.feed(&payload_bytes);
+        assert!(crc_calc.is_ok(), "CRC validation failed, reg=0x{:04X}", crc_calc.reg());
     }
 
     #[test]
     fn data_frame_with_payload() {
-        // Data frame with some payload bytes.
-        let mut frame = [0u8; 10];
-        frame[0] = 0xFF; // dest (broadcast)
-        frame[1] = 0x42; // src
-        frame[2] = 0x01; // type (DDP short)
-        frame[3..10].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03]);
+        // Data frame with some payload bytes + CRC.
+        let mut body = [0u8; 10];
+        body[0] = 0xFF; // dest (broadcast)
+        body[1] = 0x42; // src
+        body[2] = 0x01; // type (DDP short)
+        body[3..10].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03]);
+        let crc = lt_crc(&body);
+        let mut frame = [0u8; 12];
+        frame[..10].copy_from_slice(&body);
+        frame[10] = crc[0];
+        frame[11] = crc[1];
 
         let bits = build_hdlc_bitstream(&frame).unwrap();
         let events = unstuff_bitstream(&bits);
@@ -280,20 +253,22 @@ mod tests {
             })
             .collect();
 
-        // payload = frame bytes + 2 CRC bytes
-        assert_eq!(payload.len(), frame.len() + 2);
-        assert_eq!(&payload[..frame.len()], &frame);
+        // payload = frame bytes (already including CRC)
+        assert_eq!(payload.len(), frame.len());
+        assert_eq!(&payload[..], &frame);
 
         // CRC should validate.
-        let mut crc = crate::crc::CrcCalculator::new();
-        crc.feed(&payload);
-        assert!(crc.is_ok());
+        let mut crc_calc = crate::crc::CrcCalculator::new();
+        crc_calc.feed(&payload);
+        assert!(crc_calc.is_ok());
     }
 
     #[test]
     fn all_ff_payload_bitstuffs_correctly() {
         // 0xFF bytes have runs of 8 ones, which must be bit-stuffed.
-        let frame = [0xFF, 0xFF, 0xFF];
+        let header = [0xFF, 0xFF, 0xFF];
+        let crc = lt_crc(&header);
+        let frame = [0xFF, 0xFF, 0xFF, crc[0], crc[1]];
         let bits = build_hdlc_bitstream(&frame).unwrap();
         let events = unstuff_bitstream(&bits);
 
@@ -307,21 +282,24 @@ mod tests {
 
         assert_eq!(&payload[..3], &[0xFF, 0xFF, 0xFF]);
 
-        let mut crc = crate::crc::CrcCalculator::new();
-        crc.feed(&payload);
-        assert!(crc.is_ok());
+        let mut crc_calc = crate::crc::CrcCalculator::new();
+        crc_calc.feed(&payload);
+        assert!(crc_calc.is_ok());
     }
 
     #[test]
     fn rejects_too_short_frame() {
-        assert!(build_hdlc_bitstream(&[0x42, 0x01]).is_none());
+        // Need at least 5 bytes (3 header + 2 CRC)
+        assert!(build_hdlc_bitstream(&[0x42, 0x01, 0x81, 0x00]).is_none());
         assert!(build_hdlc_bitstream(&[]).is_none());
     }
 
     #[test]
     fn minimum_frame_works() {
-        // Minimum valid LLAP: 3 bytes (dest, src, type).
-        let frame = [0x42, 0x42, 0x82]; // ACK
+        // Minimum valid LLAP: 3 header + 2 CRC = 5 bytes.
+        let header = [0x42, 0x42, 0x82]; // ACK
+        let crc = lt_crc(&header);
+        let frame = [header[0], header[1], header[2], crc[0], crc[1]];
         let bits = build_hdlc_bitstream(&frame).unwrap();
         assert!(!bits.is_empty());
 
@@ -332,7 +310,9 @@ mod tests {
 
     #[test]
     fn bitstream_starts_with_flags_ends_with_abort() {
-        let frame = [0x42, 0x01, 0x81];
+        let header = [0x42, 0x01, 0x81];
+        let crc = lt_crc(&header);
+        let frame = [header[0], header[1], header[2], crc[0], crc[1]];
         let bits = build_hdlc_bitstream(&frame).unwrap();
 
         // First 16 bits should be two flag bytes (0x7E LSB-first).
@@ -352,33 +332,15 @@ mod tests {
     // ── TX pipeline tests ─────────────────────────────────────────────
 
     #[test]
-    fn tx_buffer_has_padding_prefix() {
-        let frame = [0x42, 0x01, 0x81];
-        let (buf, _) = build_tx_buffer(&frame).unwrap();
-        assert!(buf.len() > SM1_PRE_FRAME_CYCLES);
-    }
-
-    #[test]
-    fn tx_buffer_frame_halfcells_matches() {
-        let frame = [0x42, 0x01, 0x81];
-        let (buf, frame_hc) = build_tx_buffer(&frame).unwrap();
-        let expected_frame_hc = buf.len() - SM1_PRE_FRAME_CYCLES;
-        assert_eq!(frame_hc as usize, expected_frame_hc);
-    }
-
-    #[test]
-    fn tx_enable_sequence_structure() {
-        let (pre, frame) = build_tx_enable_sequence(200);
-        assert_eq!(pre, SM1_PRE_FRAME_CYCLES as u32);
-        assert_eq!(frame, 200);
-    }
-
-    #[test]
-    fn immediate_tx_buffer_has_no_padding() {
-        let frame = [0x42, 0x01, 0x81];
+    fn tx_buffer_matches_immediate() {
+        // With SM1 removed, CSMA and immediate buffers produce identical
+        // FM-0 output (the only difference is CSMA/CA timing in the caller).
+        let header = [0x42, 0x01, 0x81];
+        let crc = lt_crc(&header);
+        let frame = [header[0], header[1], header[2], crc[0], crc[1]];
+        let csma = build_tx_buffer(&frame).unwrap();
         let imm = build_immediate_tx_buffer(&frame).unwrap();
-        let (full, _) = build_tx_buffer(&frame).unwrap();
-        assert_eq!(imm.len() + SM1_PRE_FRAME_CYCLES, full.len());
+        assert_eq!(csma.as_slice(), imm.as_slice());
     }
 
     #[test]
