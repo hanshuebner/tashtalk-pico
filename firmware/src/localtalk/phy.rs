@@ -98,7 +98,7 @@ pub fn init_phy(
         "    wait 0 pin 0",          // wait for pin LOW (first falling edge)
 
         "got_edge:",
-        "    set pins, 1",           // carrier sense HIGH
+        "    set pins, 1",            // carrier sense HIGH
         "    set x, 7",              // phase 1 threshold counter
         "    jmp pin, p1_hi",        // branch on current level
 
