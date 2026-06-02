@@ -14,4 +14,22 @@ fn main() {
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Build identity: git short hash + dirty flag + compile timestamp.
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let git_dirty = std::process::Command::new("git")
+        .args(["diff", "--quiet", "HEAD"])
+        .status()
+        .map(|s| if s.success() { "" } else { "+" })
+        .unwrap_or("+");
+    let build_id = format!("{}{}", git_hash.trim(), git_dirty);
+    println!("cargo:rustc-env=BUILD_ID={build_id}");
+    // Force rebuild when git state changes.
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/index");
 }

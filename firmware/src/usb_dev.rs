@@ -30,6 +30,14 @@ pub type UsbDevice = embassy_usb::UsbDevice<'static, Driver<'static, USB>>;
 /// All long-lived buffers are kept in `'static` storage via `StaticCell`,
 /// which is the conventional embassy-usb pattern for keeping the borrow
 /// checker happy across task boundaries.
+/// USB serial number (flash unique ID, 16 hex chars). Set during `build`.
+static mut SERIAL_PTR: Option<&'static str> = None;
+
+/// Get the USB serial number string. Returns "" if called before `build`.
+pub fn serial() -> &'static str {
+    unsafe { SERIAL_PTR.unwrap_or("") }
+}
+
 pub fn build(driver: Driver<'static, USB>, flash: FLASH) -> (UsbDevice, Cdc, Cdc) {
     // Read the flash chip's unique ID to use as USB serial number.
     // This gives each Pico a distinct identity for udev symlinks.
@@ -47,6 +55,7 @@ pub fn build(driver: Driver<'static, USB>, flash: FLASH) -> (UsbDevice, Cdc, Cdc
         }
         core::str::from_utf8(&buf[..16]).unwrap()
     };
+    unsafe { SERIAL_PTR = Some(serial); }
 
     // USB descriptor strings. The VID/PID pair below is pid.codes test
     // space — replace with a real assignment before shipping. The

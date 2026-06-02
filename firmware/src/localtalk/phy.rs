@@ -1,10 +1,16 @@
 //! PIO initialization and low-level PHY access.
+//!
+//! Configures PIO0 SM0 (TX shift-out) and PIO1 SM0 (RX edge timer).
+//! After init, core 1 accesses these via PAC — the Embassy HAL handles
+//! are leaked (mem::forget) to prevent Drop from disabling the SMs
+//! or resetting pin function selects.
+
+use core::mem;
 
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, PIO1};
 use embassy_rp::pio::{
     Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig, ShiftDirection,
-    StateMachine,
 };
 use embassy_rp::Peripheral;
 use fixed::types::U24F8;
@@ -26,36 +32,31 @@ const fn clock_div(target_hz: u32) -> U24F8 {
     U24F8::from_bits(div_x256 as u32)
 }
 
-/// TX data shift-out (PIO0 SM0).
-pub struct LtTxData<'d> {
-    pub sm: StateMachine<'d, PIO0, 0>,
-}
-
-/// TX driver enable (GPIO output, directly driven by software).
-pub struct LtTxEnable<'d> {
-    pub de: Output<'d>,
-}
-
-/// RX edge timer + carrier sense (PIO1 SM0).
-pub struct LtRx<'d> {
-    pub sm: StateMachine<'d, PIO1, 0>,
-}
-
-pub fn init_phy<'d>(
-    pio0: impl Peripheral<P = PIO0> + 'd,
+/// Initialize PIO state machines and pin configuration.
+///
+/// After this call:
+/// - PIO0 SM0 is configured for TX but NOT enabled (core 1 enables per-TX).
+/// - PIO1 SM0 is configured and ENABLED for continuous RX.
+/// - GP3 (DE) is configured as SIO output, driven low.
+///
+/// All Embassy handles are leaked via `mem::forget` to prevent their
+/// Drop impls from disabling state machines or resetting pin function
+/// selects. Core 1 accesses hardware via PAC registers.
+pub fn init_phy(
+    pio0: impl Peripheral<P = PIO0> + 'static,
     _pio0_irqs: Pio0Irqs,
-    pio1: impl Peripheral<P = PIO1> + 'd,
+    pio1: impl Peripheral<P = PIO1> + 'static,
     _pio1_irqs: Pio1Irqs,
-    tx_data_pin: impl Peripheral<P = impl PioPin> + 'd,
-    tx_en_pin: impl Peripheral<P = impl embassy_rp::gpio::Pin> + 'd,
-    rx_data_pin: impl Peripheral<P = impl PioPin> + 'd,
-    carrier_sense_pin: impl Peripheral<P = impl PioPin> + 'd,
-) -> (LtTxData<'d>, LtTxEnable<'d>, LtRx<'d>) {
+    tx_data_pin: impl Peripheral<P = impl PioPin> + 'static,
+    tx_en_pin: impl Peripheral<P = impl embassy_rp::gpio::Pin> + 'static,
+    rx_data_pin: impl Peripheral<P = impl PioPin> + 'static,
+    carrier_sense_pin: impl Peripheral<P = impl PioPin> + 'static,
+) {
     // ── PIO0: SM0 (TX Data Shift-out) ──────────────────────────────
 
     let Pio {
-        mut common,
-        mut sm0,
+        common: mut common0,
+        sm0: mut tx_sm,
         ..
     } = Pio::new(pio0, Pio0Irqs {});
 
@@ -64,8 +65,8 @@ pub fn init_phy<'d>(
         "    out pins, 1",
         ".wrap",
     );
-    let tx_data_loaded = common.load_program(&tx_data_prog.program);
-    let tx_data_pin_obj = common.make_pio_pin(tx_data_pin);
+    let tx_data_loaded = common0.load_program(&tx_data_prog.program);
+    let tx_data_pin_obj = common0.make_pio_pin(tx_data_pin);
 
     let mut tx_data_cfg = Config::default();
     tx_data_cfg.use_program(&tx_data_loaded, &[]);
@@ -77,22 +78,18 @@ pub fn init_phy<'d>(
     };
     tx_data_cfg.fifo_join = FifoJoin::TxOnly;
     tx_data_cfg.clock_divider = clock_div(TX_CLOCK_HZ);
-    sm0.set_config(&tx_data_cfg);
-    sm0.set_pin_dirs(Direction::Out, &[&tx_data_pin_obj]);
+    tx_sm.set_config(&tx_data_cfg);
+    tx_sm.set_pin_dirs(Direction::Out, &[&tx_data_pin_obj]);
+    // SM0 left disabled — core 1 enables it per-TX.
 
     // ── GP3: TX Driver Enable (GPIO, not PIO) ──────────────────────
-    //
-    // DE is driven directly by software. Using PIO for DE would
-    // require switching the GPIO function select between PIO (for
-    // CSMA sync pulse) and SIO (for immediate TX), which is fragile.
-    // Software-driven DE is simpler and the timing is adequate — the
-    // sync pulse only needs ~bit-time precision, not cycle-level.
     let de = Output::new(tx_en_pin, Level::Low);
+    mem::forget(de); // Keep pin configured as SIO output.
 
     // ── PIO1: SM0 (RX Edge Timer + Carrier Sense) ──────────────────
 
     let Pio {
-        mut common,
+        common: mut common1,
         sm0: mut rx_sm,
         ..
     } = Pio::new(pio1, Pio1Irqs {});
@@ -132,9 +129,9 @@ pub fn init_phy<'d>(
         "    in x, 5",
         "    jmp low_state",
     );
-    let rx_loaded = common.load_program(&rx_edge_prog.program);
-    let rx_data_pin_obj = common.make_pio_pin(rx_data_pin);
-    let carrier_sense_pin_obj = common.make_pio_pin(carrier_sense_pin);
+    let rx_loaded = common1.load_program(&rx_edge_prog.program);
+    let rx_data_pin_obj = common1.make_pio_pin(rx_data_pin);
+    let carrier_sense_pin_obj = common1.make_pio_pin(carrier_sense_pin);
 
     let mut rx_cfg = Config::default();
     rx_cfg.use_program(&rx_loaded, &[]);
@@ -153,9 +150,10 @@ pub fn init_phy<'d>(
 
     rx_sm.set_enable(true);
 
-    (
-        LtTxData { sm: sm0 },
-        LtTxEnable { de },
-        LtRx { sm: rx_sm },
-    )
+    // Leak all handles to prevent Drop from disabling SMs or resetting
+    // pin function selects. Core 1 owns the hardware via PAC.
+    mem::forget(tx_sm);
+    mem::forget(common0);
+    mem::forget(rx_sm);
+    mem::forget(common1);
 }
