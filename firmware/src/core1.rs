@@ -83,6 +83,12 @@ pub fn clear_counters() {
 }
 pub static mut DIRECTED_TX_CTS_OK: u32 = 0;
 pub static mut DIRECTED_TX_TIMEOUT: u32 = 0;
+/// Timestamp of last CTS wait start (µs since boot).
+pub static mut LAST_CTS_WAIT_START: u64 = 0;
+/// Timestamp when CTS was received or deadline expired.
+pub static mut LAST_CTS_WAIT_END: u64 = 0;
+/// Number of ring entries processed during last CTS wait.
+pub static mut LAST_CTS_ENTRIES: u32 = 0;
 /// Frames received where dest is in our node bitmap (Mac → us).
 pub static mut DIRECTED_RX_COUNT: u32 = 0;
 /// Frames skipped by echo filter.
@@ -596,13 +602,39 @@ fn directed_tx(
             slot.rts_fm0_len as usize,
         );
 
+        // ── Skip RTS echo in ring buffer ─────────────────────────
+        // The RTS echo is already in the ring buffer from our TX.
+        // Skip all entries until the first idle timeout (remaining=0),
+        // which marks the end of the echo. This avoids wasting the CTS
+        // window on echo decoding.
+        // Skip echo: read entries until idle timeout or ring empty.
+        // The echo data is already in the ring buffer from our TX.
+        // We read it out quickly, then either hit the idle timeout
+        // (remaining=0) or exhaust the buffered entries. Either way,
+        // the echo is consumed and the CTS window starts clean.
+        let mut saw_data = false;
+        loop {
+            match try_read_rx() {
+                Some(w) if w & 0x1F == 0 => break, // idle timeout = echo done
+                Some(_) => { saw_data = true; }
+                None => {
+                    if saw_data { break; } // echo data consumed, timeout not yet DMA'd
+                    else { break; }        // no echo at all (shouldn't happen)
+                }
+            }
+        }
+
         // ── Wait for CTS (tight polling loop) ─────────────────────
-        // 400 µs generous window (PIC uses 200 µs).
-        let cts_deadline = read_timer_us() + 400;
+        // 400 µs window starts AFTER echo is skipped.
+        let cts_wait_start = read_timer_us();
+        let cts_deadline = cts_wait_start + 400;
         let mut cts_fm0 = Fm0State::Boundary;
         let mut cts_unstuffer = BitUnstuffer::new();
         let mut cts_assembler = FrameAssembler::new();
         let mut got_cts = false;
+        let mut entries_processed: u32 = 0;
+
+        unsafe { LAST_CTS_WAIT_START = cts_wait_start; }
 
         loop {
             if read_timer_us() > cts_deadline {
@@ -610,6 +642,7 @@ fn directed_tx(
             }
 
             if let Some(w) = try_read_rx() {
+                entries_processed += 1;
                 let remaining = w & 0x1F;
                 if remaining == 0 {
                     cts_fm0 = Fm0State::Boundary;
@@ -678,9 +711,12 @@ fn directed_tx(
             }
         }
 
+        unsafe {
+            LAST_CTS_WAIT_END = read_timer_us();
+            LAST_CTS_ENTRIES = entries_processed;
+        }
+
         if got_cts {
-            // ── Send DATA immediately ─────────────────────────────
-            // CTS-to-DATA: only register writes = sub-microsecond.
             transmit_dma(
                 slot.dma_buf.as_ptr(),
                 slot.word_count as usize,

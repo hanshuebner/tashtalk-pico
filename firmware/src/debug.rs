@@ -305,6 +305,13 @@ async fn cmd_set_node(
         }
         crate::host::update_nodes(shared, LOCAL_NODES.as_bytes());
     }
+    // Wait for core 1 to acknowledge the bitmap update.
+    // NODES_UPDATED flag is cleared by core 1 after it copies the bitmap.
+    let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(100);
+    while shared.flags.load(Ordering::Relaxed) & crate::core1::NODES_UPDATED != 0 {
+        if embassy_time::Instant::now() >= deadline { break; }
+        embassy_time::Timer::after_micros(10).await;
+    }
     if set {
         write_chunked(cdc, b"NODE SET\r\n").await
     } else {
@@ -534,6 +541,14 @@ fn pio_status(shared: &SharedState) -> heapless::String<768> {
         good, bad, bad_real, ar, echo_skip, overruns);
     let _ = write!(s, "Send: dir_att={} cts_ok={} tmo={} dir_rx={}\r\n",
         dir_att, dir_cts, dir_tmo, dir_rx);
+
+    let cts_start = unsafe { crate::core1::LAST_CTS_WAIT_START };
+    let cts_end = unsafe { crate::core1::LAST_CTS_WAIT_END };
+    let cts_entries = unsafe { crate::core1::LAST_CTS_ENTRIES };
+    if cts_start > 0 {
+        let _ = write!(s, "CTS wait: {}us, {} entries\r\n",
+            cts_end.saturating_sub(cts_start), cts_entries);
+    }
 
     s
 }
