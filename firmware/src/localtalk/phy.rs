@@ -25,7 +25,10 @@ embassy_rp::bind_interrupts!(pub struct Pio1Irqs {
 
 const SYS_CLK_HZ: u32 = 125_000_000;
 const TX_CLOCK_HZ: u32 = 460_800;
-const RX_CLOCK_HZ: u32 = 9_216_000;
+/// RX clock: 12× the FM-0 half-cell rate. At 230.4 kbps, half-cell =
+/// 460.8 kHz, so 12× = 5,529,600 Hz. One PIO cycle ≈ 0.181 µs.
+/// Half-cell = 12 PIO cycles. Mid-cell sample at cycle ~6.
+const RX_CLOCK_HZ: u32 = 5_529_600;
 
 const fn clock_div(target_hz: u32) -> U24F8 {
     let div_x256 = (SYS_CLK_HZ as u64 * 256 + target_hz as u64 / 2) / target_hz as u64;
@@ -94,42 +97,88 @@ pub fn init_phy(
         ..
     } = Pio::new(pio1, Pio1Irqs {});
 
-    let rx_edge_prog = pio_proc::pio_asm!(
-        "start:",
-        "    set pins, 0",
-        "    jmp pin, high_state",
-
-        "low_state:",
-        "    set x, 31",
-        "low_count:",
-        "    jmp pin, low_edge",
-        "    jmp x--, low_count",
-        "    jmp timeout",
-
-        "low_edge:",
-        "    set pins, 1",
-        "    in x, 5",
-
-        "high_state:",
-        "    set x, 31",
-        "high_count:",
-        "    jmp pin, still_high",
-        "    jmp high_edge",
-
-        "still_high:",
-        "    jmp x--, high_count",
-
-        "timeout:",
-        "    set pins, 0",
-        "    in null, 5",
-        "    jmp start",
-
-        "high_edge:",
-        "    set pins, 1",
-        "    in x, 5",
-        "    jmp low_state",
+    // FM-0 bit decoder. Detects boundary edges, delays to mid-cell,
+    // samples to determine bit value. Pushes decoded bits via autopush.
+    // Carrier sense on SET pin (HIGH during frame, LOW on idle).
+    //
+    // Clock: 12× half-cell → half-cell = 12 PIO cycles.
+    // Mid-cell sample at ~6 cycles after boundary edge.
+    // Idle timeout: ~2 cell periods (24 cycles) without edge.
+    // TEMPORARY: raw pin sampler. Samples JMP PIN state at PIO clock rate.
+    // With threshold=32 and left shift, each FIFO word = 32 consecutive
+    // pin samples. Should show alternating patterns during FM-0 activity.
+    let _rx_raw_sampler = pio_proc::pio_asm!(
+        ".wrap_target",
+        "    jmp pin, is_high",
+        "    in null, 1",        // pin LOW → push 0
+        "    jmp done",
+        "is_high:",
+        "    set x, 1",
+        "    in x, 1",          // pin HIGH → push 1
+        "done:",
+        ".wrap",
     );
-    let rx_loaded = common1.load_program(&rx_edge_prog.program);
+
+    let rx_fm0_prog = pio_proc::pio_asm!(
+        // === Idle: wait for first edge ===
+        "idle:",
+        "    set pins, 0",           // carrier sense LOW
+        "    jmp pin, wait_fall",    // pin HIGH → wait for falling edge
+
+        "wait_rise:",
+        "    jmp pin, got_rise",     // pin HIGH → rising boundary
+        "    jmp wait_rise",
+
+        "wait_fall:",
+        "    jmp pin, wf_cont",     // still HIGH → keep waiting
+        "    jmp got_fall",          // pin LOW → falling boundary
+        "wf_cont:",
+        "    jmp wait_fall",
+
+        // === Rising boundary (pin just went HIGH) ===
+        "got_rise:",
+        "    set pins, 1  [5]",     // carrier sense HIGH + delay 5 cycles
+        "    jmp pin, rise_one",    // mid-cell: still HIGH → '1'
+        // pin LOW → mid-cell transition → '0'
+        "    in null, 1",           // shift in 0
+        "    jmp wr_next",          // next boundary: wait for rising (pin LOW)
+
+        "rise_one:",
+        "    set x, 1",
+        "    in x, 1",              // shift in 1
+        "    jmp wf_next",          // next boundary: wait for falling (pin HIGH)
+
+        // === Falling boundary (pin just went LOW) ===
+        "got_fall:",
+        "    set pins, 1  [5]",     // carrier sense HIGH + delay 5 cycles
+        "    jmp pin, fall_zero",   // mid-cell: pin HIGH → transition → '0'
+        // pin still LOW → no transition → '1'
+        "    set x, 1",
+        "    in x, 1",              // shift in 1
+        "    jmp wr_next",          // next boundary: wait for rising (pin LOW)
+
+        "fall_zero:",
+        "    in null, 1",           // shift in 0
+        "    jmp wf_next",          // next boundary: wait for falling (pin HIGH)
+
+        // === Wait for next boundary with idle timeout ===
+        "wr_next:",                 // wait for rising edge
+        "    set x, 24",            // timeout counter
+        "wr_loop:",
+        "    jmp pin, got_rise",    // pin HIGH → rising boundary
+        "    jmp x--, wr_loop",
+        "    jmp idle",             // timeout → idle
+
+        "wf_next:",                 // wait for falling edge
+        "    set x, 24",            // timeout counter
+        "wf_loop:",
+        "    jmp pin, wf_high",     // pin HIGH → keep waiting
+        "    jmp got_fall",         // pin LOW → falling boundary
+        "wf_high:",
+        "    jmp x--, wf_loop",
+        "    jmp idle",             // timeout → idle
+    );
+    let rx_loaded = common1.load_program(&_rx_raw_sampler.program);
     let rx_data_pin_obj = common1.make_pio_pin(rx_data_pin);
     let carrier_sense_pin_obj = common1.make_pio_pin(carrier_sense_pin);
 
@@ -138,7 +187,7 @@ pub fn init_phy(
     rx_cfg.set_set_pins(&[&carrier_sense_pin_obj]);
     rx_cfg.set_jmp_pin(&rx_data_pin_obj);
     rx_cfg.shift_in = ShiftConfig {
-        threshold: 5,
+        threshold: 32,                       // TEMP: raw sampler, 32 bits per word
         direction: ShiftDirection::Left,
         auto_fill: true,
     };
