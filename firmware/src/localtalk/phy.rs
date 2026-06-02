@@ -20,9 +20,9 @@ embassy_rp::bind_interrupts!(pub struct Pio1Irqs {
 
 const SYS_CLK_HZ: u32 = 125_000_000;
 const TX_CLOCK_HZ: u32 = 460_800;
-/// RX clock: 16× half-cell rate. Half-cell = 16 PIO cycles.
-/// Edge wait loop = 2 cycles/iteration → 8 iterations per half-cell.
-const RX_CLOCK_HZ: u32 = 7_372_800;
+/// RX clock: 20× half-cell rate. Half-cell = 20 PIO cycles.
+/// Edge wait loop = 2 cycles/iteration → 10 iterations per half-cell.
+const RX_CLOCK_HZ: u32 = 9_216_000;
 
 const fn clock_div(target_hz: u32) -> U24F8 {
     let div_x256 = (SYS_CLK_HZ as u64 * 256 + target_hz as u64 / 2) / target_hz as u64;
@@ -99,7 +99,7 @@ pub fn init_phy(
 
         "got_edge:",
         "    set pins, 1",            // carrier sense HIGH
-        "    set x, 7",              // phase 1 threshold counter
+        "    set x, 12",             // phase 1: 13 iter. Half-cell=10 → x≈2. Full-cell=20 → expires at 13.
         "    jmp pin, p1_hi",        // branch on current level
 
         // Phase 1 LOW: wait for rising edge (short interval check)

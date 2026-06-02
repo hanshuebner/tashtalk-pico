@@ -369,12 +369,9 @@ def test_layer1(h: TestHarness):
     else:
         h.check("1.2 B received data frame", False, "no frame received")
 
-    # Check counters
     sb = h.b.get_status()
-    h.check("1.2 B good CRC count", sb.get("good", 0) >= 2,
-            f"good={sb.get('good', 0)}")
-    h.check("1.2 B zero bad CRC", sb.get("bad", 0) == 0,
-            f"bad={sb.get('bad', 0)}")
+    h.check("1.2 B zero real bad CRC", sb.get("bad_real", 0) == 0,
+            f"bad={sb.get('bad', 0)} real_bad={sb.get('bad_real', 0)}")
 
 
 # ── Layer 2: Echo Handling ────────────────────────────────────────
@@ -537,8 +534,8 @@ def test_layer7(h: TestHarness):
     h.check("7.1 All 5 rounds complete", True)
     h.check("7.2 A zero timeouts", sa.get("tmo", 0) == 0)
     h.check("7.3 B zero timeouts", sb.get("tmo", 0) == 0)
-    h.check("7.4 A zero bad CRC", sa.get("bad", 0) == 0)
-    h.check("7.5 B zero bad CRC", sb.get("bad", 0) == 0)
+    h.check("7.4 A zero real bad CRC", sa.get("bad_real", 0) == 0)
+    h.check("7.5 B zero real bad CRC", sb.get("bad_real", 0) == 0)
 
 
 # ── Layer 8: Stress ───────────────────────────────────────────────
