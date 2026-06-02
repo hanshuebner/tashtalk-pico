@@ -550,9 +550,9 @@ fn pio_status(shared: &SharedState) -> heapless::String<768> {
             cts_end.saturating_sub(cts_start), cts_entries);
     }
     let raw_flags = unsafe { crate::core1::RAW_FLAG_COUNT };
-    let raw_last = unsafe { crate::core1::RAW_LAST };
-    let _ = write!(s, "Raw: flags={} last=[{:02X} {:02X} {:02X} {:02X}]\r\n",
-        raw_flags, raw_last[0], raw_last[1], raw_last[2], raw_last[3]);
+    let raw_words = unsafe { crate::core1::RAW_WORDS };
+    let _ = write!(s, "Raw: flags={} w=[{:08X} {:08X} {:08X} {:08X}]\r\n",
+        raw_flags, raw_words[0], raw_words[1], raw_words[2], raw_words[3]);
 
     s
 }

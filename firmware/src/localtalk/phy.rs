@@ -28,7 +28,9 @@ const TX_CLOCK_HZ: u32 = 460_800;
 /// RX clock: 12× the FM-0 half-cell rate. At 230.4 kbps, half-cell =
 /// 460.8 kHz, so 12× = 5,529,600 Hz. One PIO cycle ≈ 0.181 µs.
 /// Half-cell = 12 PIO cycles. Mid-cell sample at cycle ~6.
-const RX_CLOCK_HZ: u32 = 5_529_600;
+/// RX clock: 16× half-cell rate for wider sampling window.
+/// Half-cell = 16 PIO cycles. Mid-cell at cycle 8.
+const RX_CLOCK_HZ: u32 = 7_372_800;
 
 const fn clock_div(target_hz: u32) -> U24F8 {
     let div_x256 = (SYS_CLK_HZ as u64 * 256 + target_hz as u64 / 2) / target_hz as u64;
@@ -107,15 +109,11 @@ pub fn init_phy(
     // TEMPORARY: raw pin sampler. Samples JMP PIN state at PIO clock rate.
     // With threshold=32 and left shift, each FIFO word = 32 consecutive
     // pin samples. Should show alternating patterns during FM-0 activity.
+    // TEMPORARY: simplest possible sampler using `in pins, 1`.
+    // Needs set_in_pins configured to GP4.
     let _rx_raw_sampler = pio_proc::pio_asm!(
         ".wrap_target",
-        "    jmp pin, is_high",
-        "    in null, 1",        // pin LOW → push 0
-        "    jmp done",
-        "is_high:",
-        "    set x, 1",
-        "    in x, 1",          // pin HIGH → push 1
-        "done:",
+        "    in pins, 1",
         ".wrap",
     );
 
@@ -137,7 +135,7 @@ pub fn init_phy(
 
         // === Rising boundary (pin just went HIGH) ===
         "got_rise:",
-        "    set pins, 1  [5]",     // carrier sense HIGH + delay 5 cycles
+        "    set pins, 1  [12]",     // carrier sense HIGH + delay 5 cycles
         "    jmp pin, rise_one",    // mid-cell: still HIGH → '1'
         // pin LOW → mid-cell transition → '0'
         "    in null, 1",           // shift in 0
@@ -150,7 +148,7 @@ pub fn init_phy(
 
         // === Falling boundary (pin just went LOW) ===
         "got_fall:",
-        "    set pins, 1  [5]",     // carrier sense HIGH + delay 5 cycles
+        "    set pins, 1  [12]",     // carrier sense HIGH + delay 5 cycles
         "    jmp pin, fall_zero",   // mid-cell: pin HIGH → transition → '0'
         // pin still LOW → no transition → '1'
         "    set x, 1",
@@ -178,7 +176,7 @@ pub fn init_phy(
         "    jmp x--, wf_loop",
         "    jmp idle",             // timeout → idle
     );
-    let rx_loaded = common1.load_program(&_rx_raw_sampler.program);
+    let rx_loaded = common1.load_program(&rx_fm0_prog.program);
     let rx_data_pin_obj = common1.make_pio_pin(rx_data_pin);
     let carrier_sense_pin_obj = common1.make_pio_pin(carrier_sense_pin);
 
@@ -186,9 +184,10 @@ pub fn init_phy(
     rx_cfg.use_program(&rx_loaded, &[]);
     rx_cfg.set_set_pins(&[&carrier_sense_pin_obj]);
     rx_cfg.set_jmp_pin(&rx_data_pin_obj);
+    rx_cfg.set_in_pins(&[&rx_data_pin_obj]);   // TEMP: for raw sampler
     rx_cfg.shift_in = ShiftConfig {
-        threshold: 32,                       // TEMP: raw sampler, 32 bits per word
-        direction: ShiftDirection::Left,
+        threshold: 8,                        // autopush every 8 decoded bits
+        direction: ShiftDirection::Right,    // LSB-first (HDLC bit order)
         auto_fill: true,
     };
     rx_cfg.fifo_join = FifoJoin::RxOnly;
