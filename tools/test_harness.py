@@ -543,6 +543,52 @@ def test_layer7(h: TestHarness):
 
 # ── Layer 8: Stress ───────────────────────────────────────────────
 
+def test_layer8_mass(h: TestHarness):
+    """Layer 8a: Mass bidirectional directed TX — hundreds of packets."""
+    print("\n=== Layer 8a: Mass Bidirectional Directed TX ===")
+    h.setup()
+
+    N = 100
+    a_ok = 0
+    b_ok = 0
+    a_tmo = 0
+    b_tmo = 0
+
+    for i in range(N):
+        # A → B
+        ok = h.a.tx_directed(0x43, bytes([i & 0xFF, 0xAA]))
+        if ok:
+            a_ok += 1
+
+        # B → A
+        ok = h.b.tx_directed(0x42, bytes([i & 0xFF, 0xBB]))
+        if ok:
+            b_ok += 1
+
+    # Read final stats
+    sa = h.a.get_status()
+    sb = h.b.get_status()
+
+    a_tmo = sa.get("tmo", 0)
+    b_tmo = sb.get("tmo", 0)
+    a_cts = sa.get("cts_ok", 0)
+    b_cts = sb.get("cts_ok", 0)
+    a_dir_rx = sa.get("dir_rx", 0)
+    b_dir_rx = sb.get("dir_rx", 0)
+
+    h.log(f"A: sent={a_ok}/{N} cts_ok={a_cts} tmo={a_tmo} dir_rx={a_dir_rx}")
+    h.log(f"B: sent={b_ok}/{N} cts_ok={b_cts} tmo={b_tmo} dir_rx={b_dir_rx}")
+
+    h.check("8a.1 A all directed TX accepted", a_ok == N, f"{a_ok}/{N}")
+    h.check("8a.2 B all directed TX accepted", b_ok == N, f"{b_ok}/{N}")
+    h.check("8a.3 A zero CTS timeouts", a_tmo == 0, f"tmo={a_tmo}")
+    h.check("8a.4 B zero CTS timeouts", b_tmo == 0, f"tmo={b_tmo}")
+    h.check("8a.5 A received all from B", a_dir_rx >= N, f"dir_rx={a_dir_rx}")
+    h.check("8a.6 B received all from A", b_dir_rx >= N, f"dir_rx={b_dir_rx}")
+    h.check("8a.7 A zero bad CRC", sa.get("bad", 0) == 0, f"bad={sa.get('bad', 0)}")
+    h.check("8a.8 B zero bad CRC", sb.get("bad", 0) == 0, f"bad={sb.get('bad', 0)}")
+
+
 def test_layer8(h: TestHarness):
     print("\n=== Layer 8: Stress ===")
     h.setup()
@@ -631,6 +677,7 @@ def main():
         6: test_layer6,
         7: test_layer7,
         8: test_layer8,
+        9: test_layer8_mass,
     }
 
     try:

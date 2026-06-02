@@ -625,9 +625,12 @@ fn directed_tx(
         }
 
         // ── Wait for CTS (tight polling loop) ─────────────────────
-        // 400 µs window starts AFTER echo is skipped.
+        // 200 µs window for CTS to START arriving (per PIC reference).
+        // Once we see edge activity (non-timeout entry in ring buffer),
+        // extend the deadline to allow full frame decode (~400µs more).
         let cts_wait_start = read_timer_us();
-        let cts_deadline = cts_wait_start + 400;
+        let mut cts_deadline = cts_wait_start + 200;
+        let mut saw_activity = false;
         let mut cts_fm0 = Fm0State::Boundary;
         let mut cts_unstuffer = BitUnstuffer::new();
         let mut cts_assembler = FrameAssembler::new();
@@ -647,6 +650,12 @@ fn directed_tx(
                 if remaining == 0 {
                     cts_fm0 = Fm0State::Boundary;
                     continue;
+                }
+                // First real edge = CTS preamble starting. Extend deadline
+                // to allow full frame reception + decode.
+                if !saw_activity {
+                    saw_activity = true;
+                    cts_deadline = read_timer_us() + 600;
                 }
 
                 let is_short = remaining > INTERVAL_THRESHOLD;
