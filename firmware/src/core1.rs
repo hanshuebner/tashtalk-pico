@@ -624,7 +624,7 @@ fn directed_tx(
 
             if let Some(w) = try_read_rx() {
                 entries_processed += 1;
-                let byte = ((w >> 24) & 0xFF) as u8;
+                let byte = (w & 0xFF) as u8;
 
                 if !saw_activity {
                     saw_activity = true;
@@ -725,7 +725,7 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
         match try_read_rx() {
             Some(w) => {
                 // Try all 4 byte positions to find where the data is
-                let byte = ((w >> 24) & 0xFF) as u8;
+                let byte = (w & 0xFF) as u8;
                 unsafe {
                     RAW_WORDS[3] = RAW_WORDS[2];
                     RAW_WORDS[2] = RAW_WORDS[1];
@@ -735,10 +735,8 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
                     RAW_LAST[2] = RAW_LAST[1];
                     RAW_LAST[1] = RAW_LAST[0];
                     RAW_LAST[0] = byte;
-                    // Check all byte positions for flags
-                    for shift in [0, 8, 16, 24] {
-                        if ((w >> shift) & 0xFF) as u8 == 0x7E { RAW_FLAG_COUNT += 1; }
-                    }
+                    // Check only the byte we actually use (bits 31..24)
+                    if byte == 0x7E { RAW_FLAG_COUNT += 1; }
                 }
                 for i in 0..8u8 {
                     let bit = (byte >> i) & 1;
