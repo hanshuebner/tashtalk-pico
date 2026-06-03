@@ -20,9 +20,7 @@ embassy_rp::bind_interrupts!(pub struct Pio1Irqs {
 
 const SYS_CLK_HZ: u32 = 125_000_000;
 const TX_CLOCK_HZ: u32 = 460_800;
-/// RX clock: 20× half-cell rate. Half-cell = 20 PIO cycles.
-/// Edge wait loop = 2 cycles/iteration → 10 iterations per half-cell.
-const RX_CLOCK_HZ: u32 = 9_216_000;
+const RX_CLOCK_HZ: u32 = 9_216_000; // 20× half-cell
 
 const fn clock_div(target_hz: u32) -> U24F8 {
     let div_x256 = (SYS_CLK_HZ as u64 * 256 + target_hz as u64 / 2) / target_hz as u64;
@@ -39,8 +37,6 @@ pub fn init_phy(
     rx_data_pin: impl Peripheral<P = impl PioPin> + 'static,
     carrier_sense_pin: impl Peripheral<P = impl PioPin> + 'static,
 ) {
-    // ── PIO0: SM0 (TX Data Shift-out) ──────────────────────────────
-
     let Pio {
         common: mut common0,
         sm0: mut tx_sm,
@@ -68,22 +64,20 @@ pub fn init_phy(
     tx_sm.set_config(&tx_data_cfg);
     tx_sm.set_pin_dirs(Direction::Out, &[&tx_data_pin_obj]);
 
-    // ── GP3: TX Driver Enable (GPIO, not PIO) ──────────────────────
     let de = Output::new(tx_en_pin, Level::Low);
     mem::forget(de);
 
     // ── PIO1: SM0 (RX FM-0 Interval Decoder) ──────────────────────
     //
-    // Two-phase interval measurement with FM-0 state machine in PIO.
-    // Y register: 0 = Boundary, non-zero = MidCell.
+    // 20× oversampling. Half-cell = 10 iter. Full cell = 20 iter.
+    // Phase 1 x=12 (13 iter). Phase 2 x=15 (16 iter).
+    // Y = FM-0 state: 0 = Boundary, non-zero = MidCell.
     //
-    // Phase 1: count down from 7 (= half-cell threshold at 8 iterations).
-    //   Edge before counter expires → short interval (half-cell).
-    // Phase 2: count down from 15 (timeout margin).
-    //   Edge in phase 2 → long interval (full cell).
-    //   Counter expires → idle timeout.
-    //
-    // Carrier sense on SET pin. Autopush decoded bits at 8 (bytes).
+    // Idle uses `wait 0 pin 0`. When GP4 idles LOW, the wait passes
+    // immediately → got_edge → timeout → idle. This cycles harmlessly.
+    // When a real frame arrives, edges are caught during got_edge counting.
+    // When GP4 idles HIGH (with bias), wait blocks until first falling edge.
+    // 32 instructions exactly (wrap replaces final jmp).
 
     let Pio {
         common: mut common1,
@@ -93,64 +87,57 @@ pub fn init_phy(
 
     let rx_fm0_prog = pio_proc::pio_asm!(
         "idle:",
-        "    set pins, 0",           // carrier sense LOW
-        "    set y, 0",              // state = Boundary
-        "    wait 0 pin 0",          // wait for pin LOW (first falling edge)
+        "    set pins, 0",           //  0: carrier sense LOW
+        "    set y, 0",              //  1: Boundary state
+        "    wait 0 pin 0",          //  2: wait for LOW (or pass if already LOW)
 
+        ".wrap_target",
         "got_edge:",
-        "    set pins, 1",            // carrier sense HIGH
-        "    set x, 12",             // phase 1: 13 iter. Half-cell=10 → x≈2. Full-cell=20 → expires at 13.
-        "    jmp pin, p1_hi",        // branch on current level
+        "    set pins, 1",           //  3: carrier sense HIGH
+        "    set x, 12",             //  4: phase 1 counter
+        "    jmp pin, p1_hi",        //  5
 
-        // Phase 1 LOW: wait for rising edge (short interval check)
         "p1_lo:",
-        "    jmp pin, short_int",    // pin HIGH → short interval
-        "    jmp x--, p1_lo",
-        // Counter expired → phase 2 (long interval range)
-        "    set x, 15",
+        "    jmp pin, short_int",    //  6
+        "    jmp x--, p1_lo",        //  7
+        "    set x, 15",             //  8: phase 2
         "p2_lo:",
-        "    jmp pin, long_int",     // pin HIGH → long interval
-        "    jmp x--, p2_lo",
-        "    jmp idle",              // timeout
+        "    jmp pin, long_int",     //  9
+        "    jmp x--, p2_lo",        // 10
+        "    jmp idle",              // 11: timeout
 
-        // Phase 1 HIGH: wait for falling edge
         "p1_hi:",
-        "    jmp pin, p1_hi_c",      // still HIGH → continue
-        "    jmp short_int",         // pin LOW → short interval
+        "    jmp pin, p1_hi_c",      // 12
+        "    jmp short_int",         // 13
         "p1_hi_c:",
-        "    jmp x--, p1_hi",
-        // Counter expired → phase 2
-        "    set x, 15",
+        "    jmp x--, p1_hi",        // 14
+        "    set x, 15",             // 15: phase 2
         "p2_hi:",
-        "    jmp pin, p2_hi_c",      // still HIGH
-        "    jmp long_int",          // pin LOW → long interval
+        "    jmp pin, p2_hi_c",      // 16
+        "    jmp long_int",          // 17
         "p2_hi_c:",
-        "    jmp x--, p2_hi",
-        "    jmp idle",              // timeout
+        "    jmp x--, p2_hi",        // 18
+        "    jmp idle",              // 19: timeout
 
-        // === Short interval (half-cell) ===
         "short_int:",
-        "    jmp !y, short_bnd",     // Y=0 → Boundary
-        // MidCell + short → complete '0', back to Boundary
-        "    set y, 0",
-        "    jmp got_edge",
+        "    jmp !y, short_bnd",     // 20
+        "reset_y:",
+        "    set y, 0",              // 21: MidCell → Boundary (shared)
+        "    jmp got_edge",          // 22
 
-        "short_bnd:",                // Boundary + short → '0' bit
-        "    in null, 1",            // push 0
-        "    set y, 1",              // enter MidCell
-        "    jmp got_edge",
+        "short_bnd:",
+        "    in null, 1",            // 23: push '0'
+        "    set y, 1",              // 24: → MidCell
+        "    jmp got_edge",          // 25
 
-        // === Long interval (full cell) ===
         "long_int:",
-        "    jmp !y, long_bnd",      // Y=0 → Boundary
-        // MidCell + long → error, reset
-        "    set y, 0",
-        "    jmp got_edge",
+        "    jmp !y, long_bnd",      // 26
+        "    jmp reset_y",           // 27: MidCell + long → error
 
-        "long_bnd:",                 // Boundary + long → '1' bit
-        "    set x, 1",
-        "    in x, 1",               // push 1
-        "    jmp got_edge",
+        "long_bnd:",
+        "    set x, 1",              // 28
+        "    in x, 1",               // 29: push '1'
+        ".wrap",                     // wraps to got_edge (30 → 3)
     );
 
     let rx_loaded = common1.load_program(&rx_fm0_prog.program);
@@ -161,10 +148,10 @@ pub fn init_phy(
     rx_cfg.use_program(&rx_loaded, &[]);
     rx_cfg.set_set_pins(&[&carrier_sense_pin_obj]);
     rx_cfg.set_jmp_pin(&rx_data_pin_obj);
-    rx_cfg.set_in_pins(&[&rx_data_pin_obj]); // for wait instruction
+    rx_cfg.set_in_pins(&[&rx_data_pin_obj]); // for wait pin instruction
     rx_cfg.shift_in = ShiftConfig {
-        threshold: 8,                        // autopush every 8 decoded bits
-        direction: ShiftDirection::Right,    // LSB-first (HDLC bit order)
+        threshold: 8,
+        direction: ShiftDirection::Right,
         auto_fill: true,
     };
     rx_cfg.fifo_join = FifoJoin::RxOnly;
