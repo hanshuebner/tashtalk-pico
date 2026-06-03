@@ -731,10 +731,10 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
                     RAW_WORDS[2] = RAW_WORDS[1];
                     RAW_WORDS[1] = RAW_WORDS[0];
                     RAW_WORDS[0] = w;
-                    RAW_LAST[3] = (w & 0xFF) as u8;
-                    RAW_LAST[2] = ((w >> 8) & 0xFF) as u8;
-                    RAW_LAST[1] = ((w >> 16) & 0xFF) as u8;
-                    RAW_LAST[0] = ((w >> 24) & 0xFF) as u8;
+                    RAW_LAST[3] = RAW_LAST[2];
+                    RAW_LAST[2] = RAW_LAST[1];
+                    RAW_LAST[1] = RAW_LAST[0];
+                    RAW_LAST[0] = byte;
                     // Check all byte positions for flags
                     for shift in [0, 8, 16, 24] {
                         if ((w >> shift) & 0xFF) as u8 == 0x7E { RAW_FLAG_COUNT += 1; }
