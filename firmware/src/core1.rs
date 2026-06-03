@@ -93,17 +93,20 @@ pub static mut LAST_CTS_ENTRIES: u32 = 0;
 pub static mut DIRECTED_RX_COUNT: u32 = 0;
 /// Frames skipped by echo filter.
 pub static mut ECHO_SKIP_COUNT: u32 = 0;
-/// Debug: count of 0x7E bytes seen in raw PIO output.
-pub static mut RAW_FLAG_COUNT: u32 = 0;
-/// Debug: last 4 raw bytes from PIO.
-pub static mut RAW_LAST: [u8; 4] = [0; 4];
-/// Debug: last 4 raw 32-bit words from DMA ring.
-pub static mut RAW_WORDS: [u32; 4] = [0; 4];
 
 // ── DMA buffers (core 1 exclusive) ────────────────────────────────
 pub const TX_DMA_BUF_WORDS: usize = 512;
 static mut AUTOREPLY_DMA_BUF: [u32; 16] = [0u32; 16];
 
+
+// ── RX constants ──────────────────────────────────────────────────
+const INTERVAL_THRESHOLD: u32 = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fm0State {
+    Boundary,
+    MidCell,
+}
 
 // ── Shared state ───────────────────────────────────────────────────
 
@@ -599,17 +602,36 @@ fn directed_tx(
             slot.rts_fm0_len as usize,
         );
 
-        // ── Wait for CTS ──────────────────────────────────────────
-        // PIO decodes FM-0 in hardware. The ring buffer has decoded
-        // bytes from: our RTS echo (valid frame), then idle, then
-        // the peer's CTS. We decode through all of them looking for
-        // a CTS that matches our pending RTS.
-        //
-        // 200µs window for CTS to start arriving. Once we see any
-        // data, extend to 600µs for full frame decode.
+        // ── Skip RTS echo in ring buffer ─────────────────────────
+        // The RTS echo is already in the ring buffer from our TX.
+        // Skip all entries until the first idle timeout (remaining=0),
+        // which marks the end of the echo. This avoids wasting the CTS
+        // window on echo decoding.
+        // Skip echo: read entries until idle timeout or ring empty.
+        // The echo data is already in the ring buffer from our TX.
+        // We read it out quickly, then either hit the idle timeout
+        // (remaining=0) or exhaust the buffered entries. Either way,
+        // the echo is consumed and the CTS window starts clean.
+        let mut saw_data = false;
+        loop {
+            match try_read_rx() {
+                Some(w) if w & 0x1F == 0 => break, // idle timeout = echo done
+                Some(_) => { saw_data = true; }
+                None => {
+                    if saw_data { break; } // echo data consumed, timeout not yet DMA'd
+                    else { break; }        // no echo at all (shouldn't happen)
+                }
+            }
+        }
+
+        // ── Wait for CTS (tight polling loop) ─────────────────────
+        // 200 µs window for CTS to START arriving (per PIC reference).
+        // Once we see edge activity (non-timeout entry in ring buffer),
+        // extend the deadline to allow full frame decode (~400µs more).
         let cts_wait_start = read_timer_us();
         let mut cts_deadline = cts_wait_start + 200;
         let mut saw_activity = false;
+        let mut cts_fm0 = Fm0State::Boundary;
         let mut cts_unstuffer = BitUnstuffer::new();
         let mut cts_assembler = FrameAssembler::new();
         let mut got_cts = false;
@@ -619,20 +641,44 @@ fn directed_tx(
 
         loop {
             if read_timer_us() > cts_deadline {
-                break;
+                break; // Timeout — no CTS.
             }
 
             if let Some(w) = try_read_rx() {
                 entries_processed += 1;
-                let byte = (w & 0xFF) as u8;
-
+                let remaining = w & 0x1F;
+                if remaining == 0 {
+                    cts_fm0 = Fm0State::Boundary;
+                    continue;
+                }
+                // First real edge = CTS preamble starting. Extend deadline
+                // to allow full frame reception + decode.
                 if !saw_activity {
                     saw_activity = true;
                     cts_deadline = read_timer_us() + 600;
                 }
 
-                for i in 0..8u8 {
-                    let bit = (byte >> i) & 1;
+                let is_short = remaining > INTERVAL_THRESHOLD;
+                let bit = match cts_fm0 {
+                    Fm0State::Boundary => {
+                        if is_short {
+                            cts_fm0 = Fm0State::MidCell;
+                            Some(0u8)
+                        } else {
+                            Some(1u8)
+                        }
+                    }
+                    Fm0State::MidCell => {
+                        cts_fm0 = Fm0State::Boundary;
+                        if !is_short {
+                            cts_unstuffer.reset();
+                            cts_assembler.feed_abort();
+                        }
+                        None
+                    }
+                };
+
+                if let Some(bit) = bit {
                     match cts_unstuffer.feed_bit(bit) {
                         UnstuffEvent::Byte(b) => {
                             cts_assembler.feed_byte(b);
@@ -643,6 +689,7 @@ fn directed_tx(
                                 if frame_crc_ok(frame)
                                     && cts_matches_pending(frame, our_src, their_dest)
                                 {
+                                    // Forward CTS to host if rx_slot free.
                                     if shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
                                         let n = frame.len().min(MAX_FRAME_LEN);
                                         let rx = unsafe { &mut *shared.rx_slot.get() };
@@ -660,6 +707,7 @@ fn directed_tx(
                         }
                         UnstuffEvent::Abort => {
                             cts_assembler.feed_abort();
+                            cts_fm0 = Fm0State::Boundary;
                             cts_unstuffer.reset();
                         }
                         UnstuffEvent::None => {}
@@ -703,6 +751,7 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
     compiler_fence(Ordering::SeqCst);
 
     // Local state — entirely owned by core 1.
+    let mut fm0_state = Fm0State::Boundary;
     let mut unstuffer = BitUnstuffer::new();
     let mut assembler = FrameAssembler::new();
     let mut backoff = BackoffState::new();
@@ -720,36 +769,37 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
         }
 
         // ── Poll PIO1 RX FIFO (hot path) ─────────────────────────
-        // PIO FM-0 decoder pushes 8 decoded bits per FIFO entry.
-        // Unpack each byte into individual bits for the HDLC unstuffer.
         match try_read_rx() {
             Some(w) => {
-                // Try all 4 byte positions to find where the data is
-                let byte = (w & 0xFF) as u8;
-                unsafe {
-                    RAW_WORDS[3] = RAW_WORDS[2];
-                    RAW_WORDS[2] = RAW_WORDS[1];
-                    RAW_WORDS[1] = RAW_WORDS[0];
-                    RAW_WORDS[0] = w;
-                    RAW_LAST[3] = RAW_LAST[2];
-                    RAW_LAST[2] = RAW_LAST[1];
-                    RAW_LAST[1] = RAW_LAST[0];
-                    RAW_LAST[0] = byte;
-                    // Check only the byte we actually use (bits 31..24)
-                    if byte == 0x7E { RAW_FLAG_COUNT += 1; }
-                    // Also count non-zero bytes
-                    if byte != 0 {
-                        static mut NONZERO_COUNT: u32 = 0;
-                        NONZERO_COUNT += 1;
-                    }
-                    // Store full raw word
-                    RAW_LAST[0] = (w & 0xFF) as u8;
-                    RAW_LAST[1] = ((w >> 8) & 0xFF) as u8;
-                    RAW_LAST[2] = ((w >> 16) & 0xFF) as u8;
-                    RAW_LAST[3] = ((w >> 24) & 0xFF) as u8;
+                let remaining = w & 0x1F;
+
+                if remaining == 0 {
+                    fm0_state = Fm0State::Boundary;
+                    continue;
                 }
-                for i in 0..8u8 {
-                    let bit = (byte >> i) & 1;
+
+                let is_short = remaining > INTERVAL_THRESHOLD;
+
+                let bit = match fm0_state {
+                    Fm0State::Boundary => {
+                        if is_short {
+                            fm0_state = Fm0State::MidCell;
+                            Some(0u8)
+                        } else {
+                            Some(1u8)
+                        }
+                    }
+                    Fm0State::MidCell => {
+                        fm0_state = Fm0State::Boundary;
+                        if !is_short {
+                            unstuffer.reset();
+                            assembler.feed_abort();
+                        }
+                        None
+                    }
+                };
+
+                if let Some(bit) = bit {
                     match unstuffer.feed_bit(bit) {
                         UnstuffEvent::Byte(b) => {
                             assembler.feed_byte(b);
@@ -835,6 +885,7 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
                         }
                         UnstuffEvent::Abort => {
                             assembler.feed_abort();
+                            fm0_state = Fm0State::Boundary;
                             unstuffer.reset();
                         }
                         UnstuffEvent::None => {}

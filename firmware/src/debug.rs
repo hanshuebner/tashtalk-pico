@@ -549,8 +549,9 @@ fn pio_status(shared: &SharedState) -> heapless::String<768> {
         let _ = write!(s, "CTS wait: {}us, {} entries\r\n",
             cts_end.saturating_sub(cts_start), cts_entries);
     }
-    let raw_flags = unsafe { crate::core1::RAW_FLAG_COUNT };
-    let raw_words = unsafe { crate::core1::RAW_WORDS };
+    // Raw debug counters removed — using old edge timer PIO.
+    let raw_flags = 0u32;
+    let raw_words = [0u32; 4];
     let _ = write!(s, "Raw: flags={} w=[{:08X} {:08X} {:08X} {:08X}]\r\n",
         raw_flags, raw_words[0], raw_words[1], raw_words[2], raw_words[3]);
 
