@@ -737,6 +737,16 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
                     RAW_LAST[0] = byte;
                     // Check only the byte we actually use (bits 31..24)
                     if byte == 0x7E { RAW_FLAG_COUNT += 1; }
+                    // Also count non-zero bytes
+                    if byte != 0 {
+                        static mut NONZERO_COUNT: u32 = 0;
+                        NONZERO_COUNT += 1;
+                    }
+                    // Store full raw word
+                    RAW_LAST[0] = (w & 0xFF) as u8;
+                    RAW_LAST[1] = ((w >> 8) & 0xFF) as u8;
+                    RAW_LAST[2] = ((w >> 16) & 0xFF) as u8;
+                    RAW_LAST[3] = ((w >> 24) & 0xFF) as u8;
                 }
                 for i in 0..8u8 {
                     let bit = (byte >> i) & 1;
