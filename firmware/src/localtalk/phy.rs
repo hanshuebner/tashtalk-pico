@@ -1,6 +1,6 @@
 //! PIO initialization and low-level PHY access.
 //!
-//! Configures PIO0 SM0 (TX shift-out) and PIO1 SM0 (RX edge timer).
+//! Configures PIO0 SM0 (TX shift-out) and PIO1 SM0 (RX FM-0 decoder).
 //! After init, core 1 accesses these via PAC — the Embassy HAL handles
 //! are leaked (mem::forget) to prevent Drop from disabling the SMs
 //! or resetting pin function selects.
@@ -25,7 +25,9 @@ embassy_rp::bind_interrupts!(pub struct Pio1Irqs {
 
 const SYS_CLK_HZ: u32 = 125_000_000;
 const TX_CLOCK_HZ: u32 = 460_800;
-const RX_CLOCK_HZ: u32 = 9_216_000;
+/// 16× oversampling of the 230.4 kbps FM-0 bit rate.
+/// Half bit cell = 8 PIO cycles, full cell = 16 cycles.
+const RX_CLOCK_HZ: u32 = 3_686_400;
 
 const fn clock_div(target_hz: u32) -> U24F8 {
     let div_x256 = (SYS_CLK_HZ as u64 * 256 + target_hz as u64 / 2) / target_hz as u64;
@@ -94,59 +96,98 @@ pub fn init_phy(
         ..
     } = Pio::new(pio1, Pio1Irqs {});
 
-    let rx_edge_prog = pio_proc::pio_asm!(
-        "start:",
-        "    set pins, 0",
-        "    jmp pin, high_state",
+    // ── PIO1 SM0: Hardware FM-0 decoder ───────────────────────────────
+    //
+    // Decodes FM-0 (differential Manchester) directly in PIO hardware.
+    // At 16× oversampling (3.6864 MHz), one bit cell = 16 PIO cycles,
+    // half cell = 8 cycles.
+    //
+    // Algorithm: after each boundary transition (mandatory in FM-0),
+    // delay to mid-cell and sample. If the pin level changed → mid-cell
+    // transition → bit 0. If unchanged → bit 1. The `wait` instructions
+    // serve double duty: edge detection during idle AND mid-cell delay
+    // provider when jumped to from the boundary polling loop.
+    //
+    // Frame end: when no boundary arrives within the timeout (~1.75
+    // cells), pushes 0xFFFFFFFF as frame-end marker and returns to idle.
+    //
+    // Output: autopush every 8 decoded bits. Each FIFO word has one
+    // byte of decoded FM-0 data in bits [31:24]. Frame-end marker
+    // 0xFFFFFFFF is distinguishable (normal words have [23:0] = 0).
+    let rx_fm0_prog = pio_proc::pio_asm!(
+        // One-time init: y = 0xFFFFFFFF. Bit 0 = 1 for `in y, 1`.
+        "    mov y, !null",
 
-        "low_state:",
-        "    set x, 31",
-        "low_count:",
-        "    jmp pin, low_edge",
-        "    jmp x--, low_count",
-        "    jmp timeout",
+        ".wrap_target",
+        // ── Idle: clear ISR, detect first transition ──
+        "    mov isr, null",
+        "    jmp pin, falling",        // pin HIGH → wait for falling edge
 
-        "low_edge:",
-        "    set pins, 1",
-        "    in x, 5",
+        // ── Rising edge entry (idle LOW or mid-frame boundary) ──
+        "rising:",
+        "    wait 1 pin 0 [7]",        // wait for/confirm HIGH + 8-cycle delay
+        "    jmp pin, high_b1",        // sample: still HIGH → bit 1
+        "    in null, 1",              // went LOW at mid-cell → bit 0
+        "    set x, 7",
+        "high_b0_wait:",
+        "    jmp pin, rising",         // rising edge → re-enter
+        "    jmp x--, high_b0_wait",
+        "    jmp frame_end",           // timeout
 
-        "high_state:",
-        "    set x, 31",
-        "high_count:",
-        "    jmp pin, still_high",
-        "    jmp high_edge",
+        "high_b1:",
+        "    in y, 1",                 // bit 1
+        "    set x, 7",
+        "high_b1_wait:",
+        "    jmp pin, high_b1_stay",   // still HIGH → keep waiting
+        "    jmp falling",             // went LOW → falling edge path
+        "high_b1_stay:",
+        "    jmp x--, high_b1_wait",
+        "    jmp frame_end",           // timeout
 
-        "still_high:",
-        "    jmp x--, high_count",
+        // ── Falling edge entry (idle HIGH or mid-frame boundary) ──
+        "falling:",
+        "    wait 0 pin 0 [7]",        // wait for/confirm LOW + 8-cycle delay
+        "    jmp pin, low_b0",         // sample: went HIGH → bit 0
+        "    in y, 1",                 // still LOW → bit 1
+        "    set x, 7",
+        "low_b1_wait:",
+        "    jmp pin, rising",         // rising edge → rising path
+        "    jmp x--, low_b1_wait",
+        "    jmp frame_end",           // timeout
 
-        "timeout:",
-        "    set pins, 0",
-        "    in null, 5",
-        "    jmp start",
+        "low_b0:",
+        "    in null, 1",              // bit 0
+        "    set x, 7",
+        "low_b0_wait:",
+        "    jmp pin, low_b0_stay",    // still HIGH → keep waiting
+        "    jmp falling",             // went LOW → falling edge path
+        "low_b0_stay:",
+        "    jmp x--, low_b0_wait",
+        // timeout falls through ↓
 
-        "high_edge:",
-        "    set pins, 1",
-        "    in x, 5",
-        "    jmp low_state",
+        "frame_end:",
+        "    mov isr, !null",          // ISR = 0xFFFFFFFF
+        "    push noblock",            // push frame-end marker
+        ".wrap",
     );
-    let rx_loaded = common1.load_program(&rx_edge_prog.program);
+    let rx_loaded = common1.load_program(&rx_fm0_prog.program);
     let rx_data_pin_obj = common1.make_pio_pin(rx_data_pin);
-    let carrier_sense_pin_obj = common1.make_pio_pin(carrier_sense_pin);
+    // GP5 not used by PIO — consume pin to prevent accidental reuse.
+    let _carrier_sense_pin_obj = common1.make_pio_pin(carrier_sense_pin);
 
     let mut rx_cfg = Config::default();
     rx_cfg.use_program(&rx_loaded, &[]);
-    rx_cfg.set_set_pins(&[&carrier_sense_pin_obj]);
     rx_cfg.set_jmp_pin(&rx_data_pin_obj);
+    rx_cfg.set_in_pins(&[&rx_data_pin_obj]);
     rx_cfg.shift_in = ShiftConfig {
-        threshold: 5,
-        direction: ShiftDirection::Left,
+        threshold: 8,
+        direction: ShiftDirection::Right,
         auto_fill: true,
     };
     rx_cfg.fifo_join = FifoJoin::RxOnly;
     rx_cfg.clock_divider = clock_div(RX_CLOCK_HZ);
     rx_sm.set_config(&rx_cfg);
     rx_sm.set_pin_dirs(Direction::In, &[&rx_data_pin_obj]);
-    rx_sm.set_pin_dirs(Direction::Out, &[&carrier_sense_pin_obj]);
 
     rx_sm.set_enable(true);
 

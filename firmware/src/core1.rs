@@ -2,7 +2,12 @@
 //!
 //! Runs on the RP2040's second core with NO Embassy executor, NO async,
 //! NO scheduler. Owns all LocalTalk wire interaction: PIO0 SM0 (TX),
-//! PIO1 SM0 (RX), DMA CH1 (TX), DE pin (GP3), carrier sense (GP5).
+//! PIO1 SM0 (RX FM-0 decoder), DMA CH0 (RX ring), DMA CH1 (TX), DE (GP3).
+//!
+//! RX: PIO1 SM0 decodes FM-0 in hardware at 16× oversampling (3.6864 MHz).
+//! Each autopush word contains 8 decoded bits in [31:24]. Frame-end is
+//! signaled by a 0xFFFFFFFF marker word. Core 1 feeds decoded bits
+//! through BitUnstuffer → FrameAssembler in a tight poll loop.
 //!
 //! Communication with core 0 is via shared memory with atomic flag bits.
 
@@ -15,9 +20,8 @@ use embassy_rp::pac;
 use embassy_rp::pac::dma::vals::{DataSize, TreqSel};
 use portable_atomic::AtomicU32;
 use tashtalk_proto::backoff::BackoffState;
-use tashtalk_proto::bitstuff::{BitUnstuffer, UnstuffEvent};
+use tashtalk_proto::bitstuff::{BitUnstuffer, UnstuffEvent, FLAG};
 use tashtalk_proto::codec::MAX_FRAME_LEN;
-use tashtalk_proto::bitstuff::FLAG;
 use tashtalk_proto::crc::CrcCalculator;
 use tashtalk_proto::fm0::Fm0Encoder;
 use tashtalk_proto::llap::{auto_reply, cts_matches_pending, frame_crc_ok, AsmEvent, FrameAssembler};
@@ -33,7 +37,6 @@ pub const CORE1_ALIVE: u32   = 1 << 5;
 
 // ── Hardware constants ─────────────────────────────────────────────
 const DE_PIN: u32 = 3;
-const CARRIER_SENSE_PIN: u32 = 5;
 const DBG0_PIN: u32 = 6;
 const DBG1_PIN: u32 = 7;
 const TX_DMA_CH: usize = 1;
@@ -100,13 +103,16 @@ static mut AUTOREPLY_DMA_BUF: [u32; 16] = [0u32; 16];
 
 
 // ── RX constants ──────────────────────────────────────────────────
-const INTERVAL_THRESHOLD: u32 = 16;
+/// Frame-end marker pushed by PIO FM-0 decoder when idle timeout fires.
+const FRAME_END_MARKER: u32 = 0xFFFF_FFFF;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Fm0State {
-    Boundary,
-    MidCell,
-}
+/// Microsecond timestamp of last wire activity (decoded bits from PIO).
+/// Used for software carrier sense in CSMA/CA.
+static mut LAST_ACTIVITY_US: u64 = 0;
+/// Bus is considered idle if no activity for this many microseconds.
+/// One bit cell is ~4.34µs; a full flag byte is ~35µs. 50µs of silence
+/// means at least one full byte time with no transitions.
+const CARRIER_IDLE_US: u64 = 50;
 
 // ── Shared state ───────────────────────────────────────────────────
 
@@ -266,7 +272,16 @@ fn set_de(high: bool) {
 
 #[inline(always)]
 fn carrier_sense_active() -> bool {
-    pac::SIO.gpio_in(0).read() & (1 << CARRIER_SENSE_PIN) != 0
+    let now = read_timer_us();
+    let last = unsafe { LAST_ACTIVITY_US };
+    now.wrapping_sub(last) < CARRIER_IDLE_US
+}
+
+/// Mark the bus as active (called from the RX decode loop on every
+/// FM-0 event — byte, flag, or abort).
+#[inline(always)]
+fn mark_activity() {
+    unsafe { LAST_ACTIVITY_US = read_timer_us(); }
 }
 
 fn enable_pio0_sm0() {
@@ -501,25 +516,113 @@ fn busy_wait_us(us: u64) {
     }
 }
 
+// ── Frame completion (shared by main loop and CTS wait) ──────────
+
+/// Process a completed frame: stats, echo suppression, auto-reply, host forwarding.
+/// Called when FrameEnd is detected (either from HDLC flag or frame-end marker).
+fn handle_frame_end(
+    assembler: &FrameAssembler,
+    nodes: &NodeBitmap,
+    shared: &SharedState,
+    frames_seen: &mut u32,
+) {
+    *frames_seen = frames_seen.wrapping_add(1);
+    let frame = assembler.current();
+    let crc_ok = frame_crc_ok(frame);
+
+    // Echo suppression: skip frames where src is one of our nodes.
+    let is_echo = frame.len() >= 2 && nodes.contains(frame[1]);
+    if is_echo {
+        unsafe { ECHO_SKIP_COUNT += 1; }
+        return;
+    }
+
+    // Count directed frames (Mac → us).
+    if frame.len() >= 1 && nodes.contains(frame[0]) {
+        unsafe { DIRECTED_RX_COUNT += 1; }
+    }
+
+    if crc_ok {
+        unsafe {
+            GOOD_CRC_COUNT += 1;
+            LAST_GOOD_LEN = frame.len() as u16;
+            let n = frame.len().min(8);
+            LAST_GOOD_FRAME = [0u8; 8];
+            LAST_GOOD_FRAME[..n].copy_from_slice(&frame[..n]);
+        }
+    } else {
+        unsafe {
+            BAD_CRC_COUNT += 1;
+            if frame.len() > 5 { BAD_REAL_COUNT += 1; }
+            LAST_BAD_LEN = frame.len() as u16;
+            let n = frame.len().min(8);
+            LAST_BAD_FRAME = [0u8; 8];
+            LAST_BAD_FRAME[..n].copy_from_slice(&frame[..n]);
+        }
+    }
+
+    // Check auto-reply BEFORE forwarding.
+    let reply = if crc_ok {
+        auto_reply(frame, nodes).into_frame()
+    } else {
+        None
+    };
+
+    // Forward good-CRC frames to core 0 via rx_slot.
+    if crc_ok && shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
+        let n = frame.len().min(MAX_FRAME_LEN);
+        let slot = unsafe { &mut *shared.rx_slot.get() };
+        slot.buf[..n].copy_from_slice(&frame[..n]);
+        slot.len = n as u16;
+        slot.status = 0;
+        compiler_fence(Ordering::SeqCst);
+        shared.flags.fetch_or(RX_READY, Ordering::Release);
+    }
+
+    // Auto-reply TX (immediate, no CSMA).
+    if let Some(reply_frame) = reply {
+        unsafe { AUTOREPLY_COUNT += 1; }
+        dbg0_high();
+        transmit_small_frame(&reply_frame);
+        dbg0_low();
+    }
+}
+
 // ── CSMA/CA helpers ───────────────────────────────────────────────
 
 /// Wait until carrier sense is inactive (bus idle). Blocks.
+/// Drains the RX ring to keep LAST_ACTIVITY_US current.
 fn wait_bus_idle() {
     while carrier_sense_active() {
-        cortex_m::asm::nop();
+        drain_rx_for_carrier_sense();
     }
 }
 
 /// Wait for the bus to stay idle for `us` microseconds.
 /// Returns false if carrier sense fires during the wait (deferral).
+/// Drains the RX ring to keep LAST_ACTIVITY_US current.
 fn wait_idle_for(us: u64) -> bool {
     let deadline = read_timer_us() + us;
     while read_timer_us() < deadline {
+        drain_rx_for_carrier_sense();
         if carrier_sense_active() {
             return false;
         }
     }
+    drain_rx_for_carrier_sense();
     !carrier_sense_active()
+}
+
+/// Drain decoded bits from the RX ring to keep LAST_ACTIVITY_US
+/// current for carrier sense. With the PIO FM-0 decoder, any word
+/// in the ring (except frame-end marker) means bus activity.
+#[inline]
+fn drain_rx_for_carrier_sense() {
+    while let Some(word) = try_read_rx() {
+        if word != FRAME_END_MARKER {
+            mark_activity();
+        }
+    }
 }
 
 /// CSMA/CA wait + transmit. Dispatches to directed (RTS/CTS/DATA)
@@ -602,36 +705,29 @@ fn directed_tx(
             slot.rts_fm0_len as usize,
         );
 
-        // ── Skip RTS echo in ring buffer ─────────────────────────
-        // The RTS echo is already in the ring buffer from our TX.
-        // Skip all entries until the first idle timeout (remaining=0),
-        // which marks the end of the echo. This avoids wasting the CTS
-        // window on echo decoding.
-        // Skip echo: read entries until idle timeout or ring empty.
-        // The echo data is already in the ring buffer from our TX.
-        // We read it out quickly, then either hit the idle timeout
-        // (remaining=0) or exhaust the buffered entries. Either way,
-        // the echo is consumed and the CTS window starts clean.
-        let mut saw_data = false;
-        loop {
-            match try_read_rx() {
-                Some(w) if w & 0x1F == 0 => break, // idle timeout = echo done
-                Some(_) => { saw_data = true; }
-                None => {
-                    if saw_data { break; } // echo data consumed, timeout not yet DMA'd
-                    else { break; }        // no echo at all (shouldn't happen)
+        // ── Skip RTS echo ──────────────────────────────────────────
+        // Drain ring until we see the frame-end marker (PIO detected
+        // idle after our RTS echo) or timeout.
+        {
+            let echo_deadline = read_timer_us() + 500;
+            loop {
+                match try_read_rx() {
+                    Some(FRAME_END_MARKER) => break,
+                    Some(_) => {}
+                    None => {
+                        if read_timer_us() > echo_deadline { break; }
+                    }
                 }
             }
         }
 
         // ── Wait for CTS (tight polling loop) ─────────────────────
         // 200 µs window for CTS to START arriving (per PIC reference).
-        // Once we see edge activity (non-timeout entry in ring buffer),
-        // extend the deadline to allow full frame decode (~400µs more).
+        // Once we see decoded data, extend the deadline to allow full
+        // frame reception + decode.
         let cts_wait_start = read_timer_us();
         let mut cts_deadline = cts_wait_start + 200;
         let mut saw_activity = false;
-        let mut cts_fm0 = Fm0State::Boundary;
         let mut cts_unstuffer = BitUnstuffer::new();
         let mut cts_assembler = FrameAssembler::new();
         let mut got_cts = false;
@@ -641,78 +737,76 @@ fn directed_tx(
 
         loop {
             if read_timer_us() > cts_deadline {
-                break; // Timeout — no CTS.
+                break;
             }
 
-            if let Some(w) = try_read_rx() {
-                entries_processed += 1;
-                let remaining = w & 0x1F;
-                if remaining == 0 {
-                    cts_fm0 = Fm0State::Boundary;
-                    continue;
-                }
-                // First real edge = CTS preamble starting. Extend deadline
-                // to allow full frame reception + decode.
-                if !saw_activity {
-                    saw_activity = true;
-                    cts_deadline = read_timer_us() + 600;
-                }
-
-                let is_short = remaining > INTERVAL_THRESHOLD;
-                let bit = match cts_fm0 {
-                    Fm0State::Boundary => {
-                        if is_short {
-                            cts_fm0 = Fm0State::MidCell;
-                            Some(0u8)
-                        } else {
-                            Some(1u8)
-                        }
-                    }
-                    Fm0State::MidCell => {
-                        cts_fm0 = Fm0State::Boundary;
-                        if !is_short {
-                            cts_unstuffer.reset();
-                            cts_assembler.feed_abort();
-                        }
-                        None
-                    }
-                };
-
-                if let Some(bit) = bit {
-                    match cts_unstuffer.feed_bit(bit) {
-                        UnstuffEvent::Byte(b) => {
-                            cts_assembler.feed_byte(b);
-                        }
-                        UnstuffEvent::Flag => {
-                            if let Some(AsmEvent::FrameEnd) = cts_assembler.feed_flag() {
-                                let frame = cts_assembler.current();
-                                if frame_crc_ok(frame)
-                                    && cts_matches_pending(frame, our_src, their_dest)
-                                {
-                                    // Forward CTS to host if rx_slot free.
-                                    if shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
-                                        let n = frame.len().min(MAX_FRAME_LEN);
-                                        let rx = unsafe { &mut *shared.rx_slot.get() };
-                                        rx.buf[..n].copy_from_slice(&frame[..n]);
-                                        rx.len = n as u16;
-                                        rx.status = 0;
-                                        compiler_fence(Ordering::SeqCst);
-                                        shared.flags.fetch_or(RX_READY, Ordering::Release);
-                                    }
-                                    got_cts = true;
-                                    unsafe { DIRECTED_TX_CTS_OK += 1; }
-                                }
-                                cts_assembler.ack_frame_end();
+            match try_read_rx() {
+                Some(FRAME_END_MARKER) => {
+                    // Frame ended — if we were assembling, check it.
+                    if let Some(AsmEvent::FrameEnd) = cts_assembler.feed_flag() {
+                        let frame = cts_assembler.current();
+                        if frame_crc_ok(frame)
+                            && cts_matches_pending(frame, our_src, their_dest)
+                        {
+                            if shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
+                                let n = frame.len().min(MAX_FRAME_LEN);
+                                let rx = unsafe { &mut *shared.rx_slot.get() };
+                                rx.buf[..n].copy_from_slice(&frame[..n]);
+                                rx.len = n as u16;
+                                rx.status = 0;
+                                compiler_fence(Ordering::SeqCst);
+                                shared.flags.fetch_or(RX_READY, Ordering::Release);
                             }
+                            got_cts = true;
+                            unsafe { DIRECTED_TX_CTS_OK += 1; }
                         }
-                        UnstuffEvent::Abort => {
-                            cts_assembler.feed_abort();
-                            cts_fm0 = Fm0State::Boundary;
-                            cts_unstuffer.reset();
+                        cts_assembler.ack_frame_end();
+                    }
+                    cts_unstuffer.reset();
+                }
+                Some(word) => {
+                    entries_processed += 1;
+                    if !saw_activity {
+                        saw_activity = true;
+                        cts_deadline = read_timer_us() + 600;
+                    }
+                    let byte = ((word >> 24) & 0xFF) as u8;
+                    for bit_idx in 0..8u32 {
+                        let bit = (byte >> bit_idx) & 1;
+                        match cts_unstuffer.feed_bit(bit) {
+                            UnstuffEvent::Byte(b) => {
+                                cts_assembler.feed_byte(b);
+                            }
+                            UnstuffEvent::Flag => {
+                                if let Some(AsmEvent::FrameEnd) = cts_assembler.feed_flag() {
+                                    let frame = cts_assembler.current();
+                                    if frame_crc_ok(frame)
+                                        && cts_matches_pending(frame, our_src, their_dest)
+                                    {
+                                        if shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
+                                            let n = frame.len().min(MAX_FRAME_LEN);
+                                            let rx = unsafe { &mut *shared.rx_slot.get() };
+                                            rx.buf[..n].copy_from_slice(&frame[..n]);
+                                            rx.len = n as u16;
+                                            rx.status = 0;
+                                            compiler_fence(Ordering::SeqCst);
+                                            shared.flags.fetch_or(RX_READY, Ordering::Release);
+                                        }
+                                        got_cts = true;
+                                        unsafe { DIRECTED_TX_CTS_OK += 1; }
+                                    }
+                                    cts_assembler.ack_frame_end();
+                                }
+                            }
+                            UnstuffEvent::Abort => {
+                                cts_assembler.feed_abort();
+                                cts_unstuffer.reset();
+                            }
+                            UnstuffEvent::None => {}
                         }
-                        UnstuffEvent::None => {}
                     }
                 }
+                None => {}
             }
 
             if got_cts {
@@ -751,7 +845,6 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
     compiler_fence(Ordering::SeqCst);
 
     // Local state — entirely owned by core 1.
-    let mut fm0_state = Fm0State::Boundary;
     let mut unstuffer = BitUnstuffer::new();
     let mut assembler = FrameAssembler::new();
     let mut backoff = BackoffState::new();
@@ -770,122 +863,42 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
 
         // ── Poll PIO1 RX FIFO (hot path) ─────────────────────────
         match try_read_rx() {
-            Some(w) => {
-                let remaining = w & 0x1F;
-
-                if remaining == 0 {
-                    fm0_state = Fm0State::Boundary;
-                    continue;
+            Some(FRAME_END_MARKER) => {
+                // PIO detected idle after a frame. Force-complete any
+                // in-progress frame and reset for the next one.
+                // Synthetic flag triggers FrameEnd in the assembler.
+                if let Some(AsmEvent::FrameEnd) = assembler.feed_flag() {
+                    handle_frame_end(
+                        &assembler, &nodes, shared,
+                        &mut frames_seen,
+                    );
+                    assembler.ack_frame_end();
                 }
-
-                let is_short = remaining > INTERVAL_THRESHOLD;
-
-                let bit = match fm0_state {
-                    Fm0State::Boundary => {
-                        if is_short {
-                            fm0_state = Fm0State::MidCell;
-                            Some(0u8)
-                        } else {
-                            Some(1u8)
-                        }
-                    }
-                    Fm0State::MidCell => {
-                        fm0_state = Fm0State::Boundary;
-                        if !is_short {
-                            unstuffer.reset();
-                            assembler.feed_abort();
-                        }
-                        None
-                    }
-                };
-
-                if let Some(bit) = bit {
+                unstuffer.reset();
+                assembler.feed_abort(); // ensure clean state
+            }
+            Some(word) => {
+                mark_activity();
+                // Each word has 8 decoded FM-0 bits in [31:24].
+                // Feed them through the BitUnstuffer one at a time.
+                let byte = ((word >> 24) & 0xFF) as u8;
+                for bit_idx in 0..8u32 {
+                    let bit = (byte >> bit_idx) & 1;
                     match unstuffer.feed_bit(bit) {
                         UnstuffEvent::Byte(b) => {
                             assembler.feed_byte(b);
                         }
                         UnstuffEvent::Flag => {
                             if let Some(AsmEvent::FrameEnd) = assembler.feed_flag() {
-                                frames_seen = frames_seen.wrapping_add(1);
-                                let frame = assembler.current();
-                                let crc_ok = frame_crc_ok(frame);
-
-                                // Echo suppression: skip frames where src
-                                // is one of our nodes (self-echo via RS-422).
-                                let is_echo = frame.len() >= 2
-                                    && nodes.contains(frame[1]);
-
-                                // Record stats (skip echoes).
-                                if is_echo {
-                                    unsafe { ECHO_SKIP_COUNT += 1; }
-                                    assembler.ack_frame_end();
-                                    continue;
-                                }
-
-                                // Count directed frames (Mac → us).
-                                if frame.len() >= 1 && nodes.contains(frame[0]) {
-                                    unsafe { DIRECTED_RX_COUNT += 1; }
-                                }
-
-                                if crc_ok {
-                                    unsafe {
-                                        GOOD_CRC_COUNT += 1;
-                                        LAST_GOOD_LEN = frame.len() as u16;
-                                        let n = frame.len().min(8);
-                                        LAST_GOOD_FRAME = [0u8; 8];
-                                        LAST_GOOD_FRAME[..n].copy_from_slice(&frame[..n]);
-                                    }
-                                } else {
-                                    unsafe {
-                                        BAD_CRC_COUNT += 1;
-                                        if frame.len() > 5 { BAD_REAL_COUNT += 1; }
-                                        LAST_BAD_LEN = frame.len() as u16;
-                                        let n = frame.len().min(8);
-                                        LAST_BAD_FRAME = [0u8; 8];
-                                        LAST_BAD_FRAME[..n].copy_from_slice(&frame[..n]);
-                                    }
-                                }
-
-                                // Check auto-reply BEFORE forwarding.
-                                let reply = if crc_ok {
-                                    auto_reply(frame, &nodes).into_frame()
-                                } else {
-                                    None
-                                };
-
-                                // Don't forward RTS/CTS control frames to the
-                                // host — the original TashTalk handles them
-                                // internally. TailTalk doesn't expect them.
-                                // Forward to core 0 via rx_slot.
-                                // Only forward frames with good CRC — bad CRC
-                                // frames are useless to TailTalk and produce
-                                // noise errors that obscure real issues.
-                                if crc_ok
-                                    && shared.flags.load(Ordering::Relaxed) & RX_READY == 0
-                                {
-                                    let n = frame.len().min(MAX_FRAME_LEN);
-                                    let slot = unsafe { &mut *shared.rx_slot.get() };
-                                    slot.buf[..n].copy_from_slice(&frame[..n]);
-                                    slot.len = n as u16;
-                                    slot.status = 0; // good CRC
-                                    compiler_fence(Ordering::SeqCst);
-                                    shared.flags.fetch_or(RX_READY, Ordering::Release);
-                                }
-
+                                handle_frame_end(
+                                    &assembler, &nodes, shared,
+                                    &mut frames_seen,
+                                );
                                 assembler.ack_frame_end();
-
-                                // Auto-reply TX (immediate, no CSMA).
-                                if let Some(reply_frame) = reply {
-                                    unsafe { AUTOREPLY_COUNT += 1; }
-                                    dbg0_high();
-                                    transmit_small_frame(&reply_frame);
-                                    dbg0_low();
-                                }
                             }
                         }
                         UnstuffEvent::Abort => {
                             assembler.feed_abort();
-                            fm0_state = Fm0State::Boundary;
                             unstuffer.reset();
                         }
                         UnstuffEvent::None => {}
