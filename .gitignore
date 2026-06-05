@@ -4,3 +4,4 @@ Cargo.lock
 .DS_Store
 __pycache__/
 *.uf2
+*.dwf3work
