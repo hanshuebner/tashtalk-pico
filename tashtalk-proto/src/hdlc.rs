@@ -56,15 +56,23 @@ pub type HdlcBits = Vec<u8, MAX_HDLC_BITS>;
 ///
 /// Returns `None` if the frame is too short (< 5 bytes: 3 header + 2 CRC).
 pub fn build_hdlc_bitstream(frame: &[u8]) -> Option<HdlcBits> {
+    let mut bits = HdlcBits::new();
+    build_hdlc_bitstream_into(frame, &mut bits)?;
+    Some(bits)
+}
+
+/// Like [`build_hdlc_bitstream`] but writes into a caller-provided buffer.
+/// Avoids allocating 8KB on the stack.
+pub fn build_hdlc_bitstream_into(frame: &[u8], bits: &mut HdlcBits) -> Option<usize> {
     if frame.len() < 5 || frame.len() > MAX_FRAME_LEN {
         return None;
     }
 
-    let mut bits = HdlcBits::new();
+    bits.clear();
 
     // Opening flags (not bit-stuffed).
     for _ in 0..NUM_OPENING_FLAGS {
-        push_byte_as_bits(&mut bits, FLAG);
+        push_byte_as_bits(bits, FLAG);
     }
 
     // Bit-stuff the frame bytes (which already include CRC).
@@ -86,14 +94,14 @@ pub fn build_hdlc_bitstream(frame: &[u8]) -> Option<HdlcBits> {
     }
 
     // Closing flag (not bit-stuffed).
-    push_byte_as_bits(&mut bits, FLAG);
+    push_byte_as_bits(bits, FLAG);
 
     // Abort sequence: continuous 1s.
     for _ in 0..NUM_ABORT_BITS {
         let _ = bits.push(1);
     }
 
-    Some(bits)
+    Some(bits.len())
 }
 
 /// Push 8 bits of a byte (LSB first) into the bit vector.
@@ -118,18 +126,29 @@ pub type Fm0Buffer = Vec<u8, MAX_FM0_SYMBOLS>;
 ///
 /// Returns `None` if the frame is invalid.
 pub fn build_tx_buffer(frame: &[u8]) -> Option<Fm0Buffer> {
-    let hdlc_bits = build_hdlc_bitstream(frame)?;
-
+    let mut hdlc = HdlcBits::new();
     let mut fm0 = Fm0Buffer::new();
-    let mut enc = Fm0Encoder::new();
+    build_tx_buffer_into(frame, &mut hdlc, &mut fm0)?;
+    Some(fm0)
+}
 
-    for &bit in hdlc_bits.iter() {
+/// Like [`build_tx_buffer`] but writes into caller-provided buffers.
+/// Avoids allocating 16KB + 8KB on the stack. Returns the FM-0 symbol
+/// count on success.
+pub fn build_tx_buffer_into(
+    frame: &[u8],
+    hdlc_scratch: &mut HdlcBits,
+    fm0: &mut Fm0Buffer,
+) -> Option<usize> {
+    fm0.clear();
+    build_hdlc_bitstream_into(frame, hdlc_scratch)?;
+    let mut enc = Fm0Encoder::new();
+    for &bit in hdlc_scratch.iter() {
         let (a, b) = enc.encode_bit(bit);
         let _ = fm0.push(a);
         let _ = fm0.push(b);
     }
-
-    Some(fm0)
+    Some(fm0.len())
 }
 
 /// Build a PIO-ready FM-0 symbol buffer for an immediate transmission
@@ -141,18 +160,9 @@ pub fn build_tx_buffer(frame: &[u8]) -> Option<Fm0Buffer> {
 ///
 /// Returns `None` if the frame is invalid.
 pub fn build_immediate_tx_buffer(frame: &[u8]) -> Option<Fm0Buffer> {
-    let hdlc_bits = build_hdlc_bitstream(frame)?;
-
-    let mut fm0 = Fm0Buffer::new();
-    let mut enc = Fm0Encoder::new();
-
-    for &bit in hdlc_bits.iter() {
-        let (a, b) = enc.encode_bit(bit);
-        let _ = fm0.push(a);
-        let _ = fm0.push(b);
-    }
-
-    Some(fm0)
+    // Same encoding as build_tx_buffer — the distinction is conceptual
+    // (no sync pulse), not in the encoding.
+    build_tx_buffer(frame)
 }
 
 

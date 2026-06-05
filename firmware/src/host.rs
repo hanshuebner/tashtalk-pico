@@ -21,7 +21,7 @@ use embassy_usb::driver::EndpointError;
 use tashtalk_proto::codec::{
     encode_frame, CommandParser, FrameStatus, Sink, MAX_FRAME_LEN,
 };
-use tashtalk_proto::hdlc::{build_tx_buffer, build_immediate_tx_buffer, Fm0Buffer};
+use tashtalk_proto::hdlc::{build_tx_buffer_into, Fm0Buffer, HdlcBits};
 use tashtalk_proto::llap::compose_rts;
 
 /// A complete LocalTalk frame received off the wire.
@@ -107,10 +107,16 @@ async fn submit_tx(shared: &SharedState, frame: &[u8]) {
         return;
     }
 
-    // Build FM-0 encoded buffer.
-    let Some(fm0) = build_tx_buffer(frame) else {
-        warn!("TX: build_tx_buffer failed");
-        return;
+    // Build FM-0 encoded buffer using static scratch buffers (saves 24KB stack).
+    // SAFETY: submit_tx is only called from core 0, never re-entrant.
+    let fm0_len = unsafe {
+        match build_tx_buffer_into(frame, &mut TX_HDLC_BUF, &mut TX_FM0_BUF) {
+            Some(len) => len,
+            None => {
+                warn!("TX: build_tx_buffer failed");
+                return;
+            }
+        }
     };
 
     // Pack into DMA words and write to tx_slot.
@@ -125,9 +131,10 @@ async fn submit_tx(shared: &SharedState, frame: &[u8]) {
     }
 
     let slot = unsafe { &mut *shared.tx_slot.get() };
-    let word_count = pack_fm0_into_dma_buf(&fm0, &mut slot.dma_buf);
+    let fm0 = unsafe { &TX_FM0_BUF };
+    let word_count = pack_fm0_into_dma_buf(fm0, &mut slot.dma_buf);
     slot.word_count = word_count as u16;
-    slot.fm0_len = fm0.len() as u16;
+    slot.fm0_len = fm0_len as u16;
     slot.frame_dest = if frame.len() >= 1 { frame[0] } else { 0 };
     slot.frame_src = if frame.len() >= 2 { frame[1] } else { 0 };
     let is_directed = frame.len() >= 3 && frame[2] < 0x80 && frame[0] != 0xFF;
@@ -136,10 +143,15 @@ async fn submit_tx(shared: &SharedState, frame: &[u8]) {
     // For directed frames, pre-encode the RTS frame too.
     if is_directed {
         let rts = compose_rts(slot.frame_dest, slot.frame_src);
-        if let Some(rts_fm0) = build_immediate_tx_buffer(&rts) {
-            let rts_words = pack_fm0_into_rts_buf(&rts_fm0, &mut slot.rts_dma_buf);
+        // Reuse the static scratch buffers (safe: still in submit_tx).
+        let rts_ok = unsafe {
+            build_tx_buffer_into(&rts, &mut TX_HDLC_BUF, &mut TX_FM0_BUF)
+        };
+        if let Some(rts_len) = rts_ok {
+            let rts_fm0 = unsafe { &TX_FM0_BUF };
+            let rts_words = pack_fm0_into_rts_buf(rts_fm0, &mut slot.rts_dma_buf);
             slot.rts_word_count = rts_words as u16;
-            slot.rts_fm0_len = rts_fm0.len() as u16;
+            slot.rts_fm0_len = rts_len as u16;
         }
     } else {
         slot.rts_word_count = 0;
@@ -240,6 +252,11 @@ static mut PENDING_FRAME: Option<([u8; 610], u16)> = None;
 static mut PENDING_FRAME_READY: bool = false;
 /// Pending node bitmap update.
 static mut PENDING_NODES: Option<[u8; 32]> = None;
+
+/// Static scratch buffers for TX encoding — avoids 24KB on the stack.
+/// Only accessed from submit_tx (single-threaded on core 0).
+static mut TX_HDLC_BUF: HdlcBits = HdlcBits::new();
+static mut TX_FM0_BUF: Fm0Buffer = Fm0Buffer::new();
 
 impl HostSink {
     /// Drain pending operations (must be called from async context).
