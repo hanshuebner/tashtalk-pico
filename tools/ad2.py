@@ -62,6 +62,7 @@ CHANNELS = {
     "DE": 3,   # driver enable
     "RE": 4,   # receiver enable (active-low)
     "RO": 5,   # receiver output
+    "DBG0": 6, # core 1 debug trigger output (GP6)
 }
 
 CHANNEL_BY_DIO = {v: k for k, v in CHANNELS.items()}

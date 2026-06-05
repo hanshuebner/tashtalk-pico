@@ -159,9 +159,8 @@ async fn rx_bridge_task(shared: &'static core1::SharedState) {
                 _ => FrameStatus::Good,
             };
             host::try_forward_inbound(&slot.buf[..len], status);
-            if matches!(status, FrameStatus::Good) {
-                debug::log_rx_frame(&slot.buf[..len]);
-            }
+            let crc_ok = matches!(status, FrameStatus::Good);
+            debug::log_rx_frame(&slot.buf[..len], crc_ok);
             shared.flags.fetch_and(!core1::RX_READY, Ordering::Release);
         } else {
             Timer::after_micros(50).await;

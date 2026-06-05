@@ -236,6 +236,8 @@ struct HostSink {
 
 /// Pending outbound frame from the parser.
 static mut PENDING_FRAME: Option<([u8; 610], u16)> = None;
+/// Set by on_frame_end when the frame is fully received.
+static mut PENDING_FRAME_READY: bool = false;
 /// Pending node bitmap update.
 static mut PENDING_NODES: Option<[u8; 32]> = None;
 
@@ -246,9 +248,12 @@ impl HostSink {
         if let Some(bitmap) = unsafe { PENDING_NODES.take() } {
             update_nodes(self.shared, &bitmap);
         }
-        // Process outbound frames.
-        if let Some((frame_buf, frame_len)) = unsafe { PENDING_FRAME.take() } {
-            submit_tx(self.shared, &frame_buf[..frame_len as usize]).await;
+        // Process outbound frames (only when fully received).
+        if unsafe { PENDING_FRAME_READY } {
+            if let Some((frame_buf, frame_len)) = unsafe { PENDING_FRAME.take() } {
+                unsafe { PENDING_FRAME_READY = false; }
+                submit_tx(self.shared, &frame_buf[..frame_len as usize]).await;
+            }
         }
     }
 }
@@ -258,7 +263,10 @@ impl Sink for HostSink {
 
     fn on_frame_header(&mut self, _dest: u8, _src: u8, _llap_type: u8) {
         // Reset pending frame.
-        unsafe { PENDING_FRAME = Some(([0u8; 610], 0)); }
+        unsafe {
+            PENDING_FRAME = Some(([0u8; 610], 0));
+            PENDING_FRAME_READY = false;
+        }
     }
 
     fn on_frame_byte(&mut self, byte: u8) {
@@ -271,7 +279,8 @@ impl Sink for HostSink {
     }
 
     fn on_frame_end(&mut self) {
-        // Frame stays in PENDING_FRAME; drain_outbound will submit it.
+        // Signal drain_outbound that the frame is complete.
+        unsafe { PENDING_FRAME_READY = true; }
     }
 
     fn on_set_node_ids(&mut self, bitmap: &[u8; 32]) {

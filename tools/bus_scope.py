@@ -121,7 +121,8 @@ def main() -> int:
                    help="Sample rate in MHz (default: 10)")
     p.add_argument("--duration", type=float, default=0.005,
                    help="Capture duration in seconds (default: 0.005 = 5ms)")
-    p.add_argument("--trigger", choices=["de", "ro", "a", "di"], default="de",
+    p.add_argument("--trigger", choices=["de", "ro", "a", "di", "dbg0"],
+                   default="de",
                    help="Trigger channel (default: de = our TX)")
     p.add_argument("--trigger-edge", choices=["rise", "fall", "any"],
                    default="rise")

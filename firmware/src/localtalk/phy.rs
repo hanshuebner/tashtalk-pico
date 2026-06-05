@@ -104,9 +104,12 @@ pub fn init_phy(
     //
     // Algorithm: after each boundary transition (mandatory in FM-0),
     // delay to mid-cell and sample. If the pin level changed → mid-cell
-    // transition → bit 0. If unchanged → bit 1. The `wait` instructions
-    // serve double duty: edge detection during idle AND mid-cell delay
-    // provider when jumped to from the boundary polling loop.
+    // transition → bit 0. If unchanged → bit 1.
+    //
+    // `wait` instructions are used ONLY in idle state (blocking until
+    // the first frame edge). Mid-frame boundary re-entry uses `nop [7]`
+    // delays so that every in-frame code path has a finite timeout —
+    // the PIO can never stall permanently during frame reception.
     //
     // Frame end: when no boundary arrives within the timeout (~1.75
     // cells), pushes 0xFFFFFFFF as frame-end marker and returns to idle.
@@ -121,16 +124,18 @@ pub fn init_phy(
         ".wrap_target",
         // ── Idle: clear ISR, detect first transition ──
         "    mov isr, null",
-        "    jmp pin, falling",        // pin HIGH → wait for falling edge
+        "    jmp pin, idle_high",      // pin HIGH → wait for falling edge
+        "    wait 1 pin 0",            // pin LOW → wait for rising edge
+        // fall through to high_bound (pin just went HIGH)
 
-        // ── Rising edge entry (idle LOW or mid-frame boundary) ──
-        "rising:",
-        "    wait 1 pin 0 [7]",        // wait for/confirm HIGH + 8-cycle delay
+        // ── Rising boundary (pin just went HIGH) ──
+        "high_bound:",
+        "    nop [7]",                 // delay 8 cycles to mid-cell
         "    jmp pin, high_b1",        // sample: still HIGH → bit 1
-        "    in null, 1",              // went LOW at mid-cell → bit 0
+        "    in null, 1",              // went LOW → bit 0
         "    set x, 7",
         "high_b0_wait:",
-        "    jmp pin, rising",         // rising edge → re-enter
+        "    jmp pin, high_bound",     // rising edge → high_bound
         "    jmp x--, high_b0_wait",
         "    jmp frame_end",           // timeout
 
@@ -139,19 +144,21 @@ pub fn init_phy(
         "    set x, 7",
         "high_b1_wait:",
         "    jmp pin, high_b1_stay",   // still HIGH → keep waiting
-        "    jmp falling",             // went LOW → falling edge path
+        "    jmp low_bound",           // went LOW → falling boundary
         "high_b1_stay:",
         "    jmp x--, high_b1_wait",
         "    jmp frame_end",           // timeout
 
-        // ── Falling edge entry (idle HIGH or mid-frame boundary) ──
-        "falling:",
-        "    wait 0 pin 0 [7]",        // wait for/confirm LOW + 8-cycle delay
+        // ── Falling boundary (pin just went LOW) ──
+        "idle_high:",
+        "    wait 0 pin 0",            // idle: wait for falling edge
+        "low_bound:",
+        "    nop [7]",                 // delay 8 cycles to mid-cell
         "    jmp pin, low_b0",         // sample: went HIGH → bit 0
         "    in y, 1",                 // still LOW → bit 1
         "    set x, 7",
         "low_b1_wait:",
-        "    jmp pin, rising",         // rising edge → rising path
+        "    jmp pin, high_bound",     // rising edge → high_bound
         "    jmp x--, low_b1_wait",
         "    jmp frame_end",           // timeout
 
@@ -160,7 +167,7 @@ pub fn init_phy(
         "    set x, 7",
         "low_b0_wait:",
         "    jmp pin, low_b0_stay",    // still HIGH → keep waiting
-        "    jmp falling",             // went LOW → falling edge path
+        "    jmp low_bound",           // went LOW → falling boundary
         "low_b0_stay:",
         "    jmp x--, low_b0_wait",
         // timeout falls through ↓

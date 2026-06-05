@@ -20,6 +20,10 @@ use tashtalk_proto::nodemap::NodeBitmap;
 /// When true, every good-CRC received frame is printed as `RX:hex\r\n`.
 pub static MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// When true, protocol analyzer mode: all frames (including bad CRC)
+/// are forwarded to rx_slot and printed on the debug port.
+pub static ANALYZER_MODE: AtomicBool = AtomicBool::new(false);
+
 const RX_LOG_SLOTS: usize = 16;
 const RX_LOG_BYTES: usize = 64; // first N bytes of each frame stored
 static mut RX_LOG: [[u8; RX_LOG_BYTES]; RX_LOG_SLOTS] = [[0u8; RX_LOG_BYTES]; RX_LOG_SLOTS];
@@ -27,8 +31,9 @@ static mut RX_LOG_LENS: [u16; RX_LOG_SLOTS] = [0u16; RX_LOG_SLOTS];
 static mut RX_LOG_WRITE: usize = 0;
 static mut RX_LOG_COUNT: usize = 0;
 
-/// Called from rx_bridge_task for every good-CRC frame.
-pub fn log_rx_frame(frame: &[u8]) {
+/// Called from rx_bridge_task for received frames.
+/// `crc_ok` indicates whether the frame passed CRC validation.
+pub fn log_rx_frame(frame: &[u8], crc_ok: bool) {
     let n = frame.len().min(RX_LOG_BYTES);
     unsafe {
         let idx = RX_LOG_WRITE;
@@ -40,11 +45,12 @@ pub fn log_rx_frame(frame: &[u8]) {
         }
     }
 
-    if MONITOR_ENABLED.load(Ordering::Relaxed) {
+    if MONITOR_ENABLED.load(Ordering::Relaxed) || ANALYZER_MODE.load(Ordering::Relaxed) {
         let mut s: LogLine = heapless::String::new();
         let ms = embassy_time::Instant::now().as_millis();
+        let tag = if crc_ok { "RX" } else { "RX!" };
         let _ = core::fmt::Write::write_fmt(
-            &mut s, core::format_args!("[{:06}] RX:", ms));
+            &mut s, core::format_args!("[{:06}] {}:", ms, tag));
         for &b in &frame[..frame.len().min(30)] {
             let _ = core::fmt::Write::write_fmt(
                 &mut s, core::format_args!("{:02X}", b));
@@ -84,6 +90,7 @@ commands:\r\n\
   n XX      set node ID XX in bitmap\r\n\
   N XX      clear node ID XX from bitmap\r\n\
   m         toggle RX monitor (prints RX:hex lines)\r\n\
+  a         toggle analyzer mode (all frames incl bad CRC)\r\n\
   c         clear all counters\r\n\
   f         dump buffered RX frames\r\n\
   i         print USB serial number\r\n\
@@ -198,6 +205,15 @@ async fn handle_input(
                             write_chunked(cdc, b"\r\nMONITOR OFF\r\n").await?;
                         } else {
                             write_chunked(cdc, b"\r\nMONITOR ON\r\n").await?;
+                        }
+                    }
+                    b'a' | b'A' => {
+                        let prev = ANALYZER_MODE.load(Ordering::Relaxed);
+                        ANALYZER_MODE.store(!prev, Ordering::Relaxed);
+                        if prev {
+                            write_chunked(cdc, b"\r\nANALYZER OFF\r\n").await?;
+                        } else {
+                            write_chunked(cdc, b"\r\nANALYZER ON\r\n").await?;
                         }
                     }
                     b'f' | b'F' => {
@@ -520,11 +536,19 @@ fn pio_status(shared: &SharedState) -> heapless::String<768> {
     let base = unsafe { crate::core1::RX_RING.0.as_ptr() } as u32;
     let widx = (waddr.wrapping_sub(base)) / 4;
 
-    let _ = write!(s, "PIO1: sm_en={:04b} GP4(RX)={} GP5(CS)={}\r\n",
-        pio1_ctrl.sm_enable(), (gpio_in >> 4) & 1, (gpio_in >> 5) & 1);
+    let sm0_pc = pac::PIO1.sm(0).addr().read().addr();
+    let gp4_pad = pac::PADS_BANK0.gpio(4).read();
+    let gp4_ctrl = pac::IO_BANK0.gpio(4).ctrl().read();
+    let _ = write!(s, "PIO1: sm_en={:04b} sm0_pc={} GP4(RX)={} GP5(CS)={}\r\n",
+        pio1_ctrl.sm_enable(), sm0_pc, (gpio_in >> 4) & 1, (gpio_in >> 5) & 1);
+    let _ = write!(s, "GP4: funcsel={} ie={} od={} pue={} pde={}\r\n",
+        gp4_ctrl.funcsel() as u8, gp4_pad.ie() as u8, gp4_pad.od() as u8,
+        gp4_pad.pue() as u8, gp4_pad.pde() as u8);
     let _ = write!(s, "Flags: 0x{:02x} alive={} rxrdy={} txsub={}\r\n",
         flags, (flags >> 5) & 1, (flags >> 3) & 1, flags & 1);
+    let loop_count = unsafe { crate::core1::LOOP_COUNT };
     let _ = write!(s, "DMA: en={} widx={} ridx={} remain={}\r\n", en, widx, ridx, remain);
+    let _ = write!(s, "Core1: loops={}\r\n", loop_count);
 
     let good = unsafe { crate::core1::GOOD_CRC_COUNT };
     let bad = unsafe { crate::core1::BAD_CRC_COUNT };

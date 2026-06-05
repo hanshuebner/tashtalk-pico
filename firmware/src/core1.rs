@@ -62,6 +62,8 @@ pub static mut LAST_GOOD_FRAME: [u8; 8] = [0u8; 8];
 pub static mut LAST_GOOD_LEN: u16 = 0;
 /// Count of CRC-failed frames with len > 5 (likely real data, not garbage).
 pub static mut BAD_REAL_COUNT: u32 = 0;
+/// Core 1 main loop iteration counter (heartbeat).
+pub static mut LOOP_COUNT: u32 = 0;
 pub static mut RING_OVERRUN_COUNT: u32 = 0;
 pub static mut DIRECTED_TX_ATTEMPTS: u32 = 0;
 
@@ -530,9 +532,12 @@ fn handle_frame_end(
     let frame = assembler.current();
     let crc_ok = frame_crc_ok(frame);
 
+    let analyzer = crate::debug::ANALYZER_MODE.load(Ordering::Relaxed);
+
     // Echo suppression: skip frames where src is one of our nodes.
+    // In analyzer mode, show everything including echoes.
     let is_echo = frame.len() >= 2 && nodes.contains(frame[1]);
-    if is_echo {
+    if is_echo && !analyzer {
         unsafe { ECHO_SKIP_COUNT += 1; }
         return;
     }
@@ -568,13 +573,14 @@ fn handle_frame_end(
         None
     };
 
-    // Forward good-CRC frames to core 0 via rx_slot.
-    if crc_ok && shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
+    // Forward frames to core 0 via rx_slot.
+    // In normal mode: good-CRC only. In analyzer mode: all frames.
+    if (crc_ok || analyzer) && shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
         let n = frame.len().min(MAX_FRAME_LEN);
         let slot = unsafe { &mut *shared.rx_slot.get() };
         slot.buf[..n].copy_from_slice(&frame[..n]);
         slot.len = n as u16;
-        slot.status = 0;
+        slot.status = if crc_ok { 0 } else { 1 };
         compiler_fence(Ordering::SeqCst);
         shared.flags.fetch_or(RX_READY, Ordering::Release);
     }
@@ -582,9 +588,7 @@ fn handle_frame_end(
     // Auto-reply TX (immediate, no CSMA).
     if let Some(reply_frame) = reply {
         unsafe { AUTOREPLY_COUNT += 1; }
-        dbg0_high();
         transmit_small_frame(&reply_frame);
-        dbg0_low();
     }
 }
 
@@ -820,11 +824,15 @@ fn directed_tx(
         }
 
         if got_cts {
+            if slot.fm0_len > 1000 {
+                dbg0_high();
+            }
             transmit_dma(
                 slot.dma_buf.as_ptr(),
                 slot.word_count as usize,
                 slot.fm0_len as usize,
             );
+            dbg0_low();
             return true;
         }
 
@@ -852,6 +860,8 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
     let mut frames_seen: u32 = 0;
 
     loop {
+        unsafe { LOOP_COUNT = LOOP_COUNT.wrapping_add(1); }
+
         // ── Check node bitmap update (rare) ───────────────────────
         if shared.flags.load(Ordering::Relaxed) & NODES_UPDATED != 0 {
             compiler_fence(Ordering::SeqCst);
