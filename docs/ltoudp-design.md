@@ -12,13 +12,25 @@ USB-CDC host interface — not replacing it.
 | Concern | Verdict |
 |---------|---------|
 | Rust TCP/UDP stack for Pico W | `embassy-net` (smoltcp) + `cyw43` / `cyw43-pio`. First-party Embassy crates; we already build on Embassy. |
-| Flash | Current firmware `text` ≈ 42 KB of 2 MB. CYW43 firmware blob ≈ 224 KB + CLM ≈ 1 KB, plus ~80–120 KB of stack/driver code. Total well under 400 KB. **Ample.** |
-| RAM | Current `bss` ≈ 51 KB of 256 KB. cyw43 buffers + embassy-net + smoltcp socket buffers ≈ 40–60 KB (configurable). **Fits with ~150 KB to spare.** |
+| Flash | Current firmware `text` ≈ 53 KB of 2 MB. CYW43 firmware blob ≈ 224 KB + CLM ≈ 1 KB, plus ~80–120 KB of stack/driver code. Total well under 400 KB. **Ample.** |
+| RAM | Current `bss` ≈ **187 KB of 256 KB** — only ~64 KB free. (Dominated by the 64 KB embassy task arena, the 24 KB static TX encoding buffers, and the 16 KB RX ring.) cyw43 buffers + embassy-net + smoltcp socket buffers ≈ 40–60 KB even when trimmed (UDP-only, minimal socket set). **Tight — fits only with care.** |
 | PIO | RP2040 has 8 SMs; we use PIO0 SM0 (TX) + PIO1 SM0 (RX FM-0). `cyw43-pio` needs 1 SM + a small program. **Free.** |
 | DMA | 12 channels; we use CH0 (RX ring) + CH1 (TX). cyw43-pio uses ~1. **Free.** |
 | Pins | Pico W reserves GP23/24/25/29 for the CYW43 (internal SPI + WL_ON). Our bus uses GP2–GP7. **No conflict.** |
 
 Numbers re-measure with `arm-none-eabi-size target/thumbv6m-none-eabi/release/tashtalk-pico` after any build.
+
+**RAM is the binding constraint, not flash.** With ~64 KB free, a minimal
+UDP-only LToUDP build is plausible but leaves little margin. Levers, in order
+of preference:
+
+1. Shrink the embassy task arena (`task-arena-size-65536` → smaller) once the
+   actual task set is known — likely the single biggest win.
+2. Minimal smoltcp config: one UDP socket, small RX/TX socket buffers, no TCP,
+   no DHCP server, IPv4 only.
+3. Trim or share the 24 KB static TX buffers if the bridge can reuse them.
+4. **Move to the Pico 2 W (RP2350): 520 KB SRAM** makes the whole question
+   moot and is the recommended target if the RAM budget proves too tight.
 
 ## 2. Wire format recap
 

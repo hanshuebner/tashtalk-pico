@@ -42,13 +42,28 @@ Udev symlinks: `/dev/tashtalk-data-<SERIAL>`, `/dev/tashtalk-debug-<SERIAL>`
 Connect with: `kermit -l /dev/tashtalk-debug-<SERIAL> -c`
 Or: `socat - /dev/tashtalk-debug-<SERIAL>,raw,echo=0,cr,crnl`
 
-Key commands: `s` (status), `a` (analyzer mode), `m` (monitor), `c` (clear counters), `b` (reboot to BOOTSEL), `?` (help)
+Line-oriented command interpreter (`debug.rs`). Type a command and press
+Enter. `help` lists everything; full names, unique prefixes, and the legacy
+single-letter aliases all work (e.g. `status`, `stat`, or `s`).
+
+Commands: `help` `status` `clear` `monitor [on|off]` `analyzer [on|off]`
+`frames` `id` `tx <hex>` `directed <dest> <hex>` `node <set|clr> <id>`
+`testframe` `bootsel`.
+
+Every reply line is tagged for machine parsing: `OK`/`OK k=v…` and
+`ERR <code> <msg>` are terminators; `STAT …` carry status fields; `RX:`/`RX!:`
+carry frames; `#` is a banner/help comment. A host writes a line and reads
+until `OK`/`ERR`. See `docs/debug-cli-plan.md` for the format spec and the
+planned telnet front-end. To add a command: one `COMMANDS` row + one
+`dispatch` arm; `help` is generated from the table.
 
 ### Analyzer Mode
-The `a` command enables protocol analyzer mode. All decoded frames
-(including bad CRC) are printed as hex lines:
+The `analyzer` command (alias `a`) enables protocol analyzer mode. All decoded
+frames (including bad CRC) are printed as tagged hex lines:
 - `RX:` prefix = good CRC
 - `RX!:` prefix = bad CRC
+
+(Each line also carries a `t=<ms>` timestamp field before the hex.)
 
 For a passive bus sniffer, flash the same firmware to a second Pico,
 wire its GP4 to the transceiver's RO output, and enable analyzer mode.
@@ -186,7 +201,8 @@ Proposals, not yet implemented. See `docs/`:
   packet]`; packet carries NO SDLC framing and NO FCS/CRC. Multicast
   `239.192.76.84:1954`. RTS/CTS never cross the bridge.
 - `docs/ltoudp-design.md`: Pico W LToUDP bridge plan. embassy-net + cyw43 on
-  core 0 alongside USB; flash/RAM/PIO/DMA/pins all fit. Key new concern is a
+  core 0 alongside USB; flash/PIO/DMA/pins fit easily, but RAM is tight
+  (~64 KB free of 256 KB) — UDP-only trim or a Pico 2 W. Key new concern is a
   TX mux arbitrating USB + debug + bridge into core 1's single-writer TX.
 - `docs/debug-cli-plan.md`: debug.rs refactor — unified tagged output format
   (`OK`/`ERR`/`STAT`/`RX:`), a `COMMANDS` table replacing the single-letter

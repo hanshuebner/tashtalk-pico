@@ -1,8 +1,33 @@
 //! Debug CDC task — TT_DEBUG.
 //!
-//! Drains the `tt_log` channel and emits each message to the host as a
-//! line. Single-letter debug commands are processed inline. Commands
-//! that take arguments (t, n, N, d) accumulate a line buffer until CR.
+//! Drains the `tt_log` channel and emits each message to the host, and runs
+//! a line-oriented command interpreter.
+//!
+//! ## Command model
+//!
+//! Input is read a line at a time (terminated by CR or LF). A line is
+//! tokenised on whitespace into a verb plus arguments. The verb is looked up
+//! in [`COMMANDS`] — by full name, unique prefix, or single-letter alias — so
+//! adding a command is one [`CmdInfo`] table row plus one `match` arm in
+//! [`dispatch`]. `help` is generated from the table.
+//!
+//! ## Output format
+//!
+//! Every line is `\r\n`-terminated and starts with a stable tag so a host can
+//! demultiplex command replies from async events on the one CDC pipe:
+//!
+//! - `OK` / `OK k=v ...`  — command succeeded (always the last reply line)
+//! - `ERR <code> <msg>`   — command failed (always the last reply line)
+//! - `STAT ...`           — one field group of a status report
+//! - `RX:` / `RX!:`       — received frame (good / bad CRC)
+//! - `#`                  — banner / comment / help (host ignores)
+//!
+//! A host drives the port by writing a line and reading until it sees an
+//! `OK`/`ERR` terminator; `STAT`/`RX:`/`#` lines may also arrive unsolicited.
+//!
+//! See `docs/debug-cli-plan.md` for the full design, including the planned
+//! `Line` transport trait and password-protected telnet front-end that reuse
+//! this command core on the Pico W.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,16 +37,17 @@ use crate::usb_dev::Cdc;
 use defmt::{info, warn};
 use embassy_futures::select::{select, Either};
 use embassy_usb::driver::EndpointError;
+use heapless::Vec;
 use tashtalk_proto::crc::lt_crc;
 use tashtalk_proto::nodemap::NodeBitmap;
 
 // ── RX monitor and frame log ──────────────────────────────────────
 
-/// When true, every good-CRC received frame is printed as `RX:hex\r\n`.
+/// When true, every good-CRC received frame is printed as an `RX:` line.
 pub static MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// When true, protocol analyzer mode: all frames (including bad CRC)
-/// are forwarded to rx_slot and printed on the debug port.
+/// When true, protocol analyzer mode: all frames (including bad CRC) are
+/// forwarded to rx_slot and printed on the debug port.
 pub static ANALYZER_MODE: AtomicBool = AtomicBool::new(false);
 
 const RX_LOG_SLOTS: usize = 16;
@@ -48,12 +74,10 @@ pub fn log_rx_frame(frame: &[u8], crc_ok: bool) {
     if MONITOR_ENABLED.load(Ordering::Relaxed) || ANALYZER_MODE.load(Ordering::Relaxed) {
         let mut s: LogLine = heapless::String::new();
         let ms = embassy_time::Instant::now().as_millis();
-        let tag = if crc_ok { "RX" } else { "RX!" };
-        let _ = core::fmt::Write::write_fmt(
-            &mut s, core::format_args!("[{:06}] {}:", ms, tag));
+        let tag = if crc_ok { "RX:" } else { "RX!:" };
+        let _ = core::fmt::Write::write_fmt(&mut s, core::format_args!("{} t={:06} ", tag, ms));
         for &b in &frame[..frame.len().min(30)] {
-            let _ = core::fmt::Write::write_fmt(
-                &mut s, core::format_args!("{:02X}", b));
+            let _ = core::fmt::Write::write_fmt(&mut s, core::format_args!("{:02X}", b));
         }
         if frame.len() > 30 {
             let _ = core::fmt::Write::write_str(&mut s, "..");
@@ -62,61 +86,104 @@ pub fn log_rx_frame(frame: &[u8], crc_ok: bool) {
     }
 }
 
-// ── Command state machine ─────────────────────────────────────────
+// ── Command table ─────────────────────────────────────────────────
 
-const CMD_BUF_SIZE: usize = 1280;
-
-enum CmdState {
-    Idle,
-    /// Accumulating arguments for a command. `cmd` is the command letter.
-    Accumulating { cmd: u8, pos: usize },
+/// Every interpreter verb. Add a variant here, a [`COMMANDS`] row, and a
+/// `match` arm in [`dispatch`] to introduce a command.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Cmd {
+    Help,
+    Status,
+    Clear,
+    Monitor,
+    Analyzer,
+    Frames,
+    Id,
+    Tx,
+    Directed,
+    Node,
+    TestFrame,
+    Bootsel,
 }
 
-static mut CMD_BUF: [u8; CMD_BUF_SIZE] = [0u8; CMD_BUF_SIZE];
-static mut CMD_STATE: CmdState = CmdState::Idle;
+struct CmdInfo {
+    cmd: Cmd,
+    name: &'static str,
+    /// Single-letter alias, or 0 for none. (`node` is reached via the legacy
+    /// `n`/`N` aliases, handled specially in [`resolve`].)
+    alias: u8,
+    usage: &'static str,
+    summary: &'static str,
+}
 
-// ── Node bitmap (local copy on core 0 for debug commands) ─────────
+static COMMANDS: &[CmdInfo] = &[
+    CmdInfo { cmd: Cmd::Help, name: "help", alias: b'?', usage: "[cmd]", summary: "list commands / show usage" },
+    CmdInfo { cmd: Cmd::Status, name: "status", alias: b's', usage: "", summary: "counters + PIO/DMA state" },
+    CmdInfo { cmd: Cmd::Clear, name: "clear", alias: b'c', usage: "", summary: "clear counters" },
+    CmdInfo { cmd: Cmd::Monitor, name: "monitor", alias: b'm', usage: "[on|off]", summary: "RX monitor (good-CRC RX: lines)" },
+    CmdInfo { cmd: Cmd::Analyzer, name: "analyzer", alias: b'a', usage: "[on|off]", summary: "analyzer (all frames incl bad CRC)" },
+    CmdInfo { cmd: Cmd::Frames, name: "frames", alias: b'f', usage: "", summary: "dump buffered RX frames" },
+    CmdInfo { cmd: Cmd::Id, name: "id", alias: b'i', usage: "", summary: "USB serial number" },
+    CmdInfo { cmd: Cmd::Tx, name: "tx", alias: b't', usage: "<hex>", summary: "TX raw hex frame (incl CRC) via CSMA" },
+    CmdInfo { cmd: Cmd::Directed, name: "directed", alias: b'd', usage: "<dest> <hex>", summary: "directed TX (RTS/CTS dialog)" },
+    CmdInfo { cmd: Cmd::Node, name: "node", alias: 0, usage: "<set|clr> <id>", summary: "set/clear node ID in bitmap" },
+    CmdInfo { cmd: Cmd::TestFrame, name: "testframe", alias: b'p', usage: "", summary: "TX known test frame via CSMA" },
+    CmdInfo { cmd: Cmd::Bootsel, name: "bootsel", alias: b'b', usage: "", summary: "reboot to BOOTSEL" },
+];
 
-static mut LOCAL_NODES: NodeBitmap = NodeBitmap::empty();
+/// Resolve a verb token to a command. Returns the command plus an optional
+/// argument to inject ahead of the user's args (used so the legacy `n`/`N`
+/// aliases map onto `node set`/`node clr`).
+fn resolve(verb: &str) -> Option<(Cmd, Option<&'static str>)> {
+    // Single-letter aliases (including the n/N special case).
+    if verb.len() == 1 {
+        match verb.as_bytes()[0] {
+            b'n' => return Some((Cmd::Node, Some("set"))),
+            b'N' => return Some((Cmd::Node, Some("clr"))),
+            c => {
+                for ci in COMMANDS {
+                    if ci.alias == c {
+                        return Some((ci.cmd, None));
+                    }
+                }
+            }
+        }
+    }
+    // Exact name.
+    for ci in COMMANDS {
+        if ci.name == verb {
+            return Some((ci.cmd, None));
+        }
+    }
+    // Unique prefix.
+    let mut found = None;
+    for ci in COMMANDS {
+        if ci.name.starts_with(verb) {
+            if found.is_some() {
+                return None; // ambiguous
+            }
+            found = Some(ci.cmd);
+        }
+    }
+    found.map(|c| (c, None))
+}
 
 // ── Constants ─────────────────────────────────────────────────────
 
 const BUILD_ID: &str = env!("BUILD_ID");
+const LINE_BUF_SIZE: usize = 1280;
+const MAX_TOKENS: usize = 16;
 
-const HELP: &[u8] = b"\r\n\
-commands:\r\n\
-  t AABB..  TX raw hex frame (incl CRC) via CSMA\r\n\
-  d XX HEX  directed TX to node XX with payload\r\n\
-  n XX      set node ID XX in bitmap\r\n\
-  N XX      clear node ID XX from bitmap\r\n\
-  m         toggle RX monitor (prints RX:hex lines)\r\n\
-  a         toggle analyzer mode (all frames incl bad CRC)\r\n\
-  c         clear all counters\r\n\
-  f         dump buffered RX frames\r\n\
-  i         print USB serial number\r\n\
-  s         show status/counters\r\n\
-  p         TX known test frame via CSMA\r\n\
-  b         reboot to BOOTSEL\r\n\
-  ?         this help\r\n\
-\r\n";
+static mut LINE_BUF: [u8; LINE_BUF_SIZE] = [0u8; LINE_BUF_SIZE];
+static mut LINE_LEN: usize = 0;
 
-fn format_banner() -> heapless::String<256> {
-    use core::fmt::Write;
-    let mut s = heapless::String::<256>::new();
-    let serial = crate::usb_dev::serial();
-    let ms = embassy_time::Instant::now().as_millis();
-    let _ = write!(s, "\r\nTASHTALK-PICO {} serial={} uptime={}ms\r\n", BUILD_ID, serial, ms);
-    let _ = write!(s, "commands: t n N d m c f i s p b ?\r\n");
-    s
-}
+/// Local copy of the node bitmap on core 0 for debug commands.
+static mut LOCAL_NODES: NodeBitmap = NodeBitmap::empty();
 
 // ── Task entry ────────────────────────────────────────────────────
 
 #[embassy_executor::task]
-pub async fn run(
-    mut cdc: Cdc,
-    shared: &'static SharedState,
-) -> ! {
+pub async fn run(mut cdc: Cdc, shared: &'static SharedState) -> ! {
     // Wait until core 1 is alive before accepting any commands.
     while shared.flags.load(Ordering::Relaxed) & crate::core1::CORE1_ALIVE == 0 {
         embassy_time::Timer::after_millis(1).await;
@@ -126,16 +193,14 @@ pub async fn run(
     loop {
         cdc.wait_connection().await;
         info!("TT_DEBUG: host connected");
-        unsafe { CMD_STATE = CmdState::Idle; }
+        unsafe { LINE_LEN = 0 };
 
-        let banner = format_banner();
-        let _ = write_chunked(&mut cdc, banner.as_bytes()).await;
-        let _ = write_chunked(&mut cdc, b"READY\r\n").await;
+        let _ = write_banner(&mut cdc).await;
 
         loop {
             match select(cdc.read_packet(&mut buf), LOG_CHANNEL.receive()).await {
                 Either::First(Ok(n)) => {
-                    if let Err(e) = handle_input(&mut cdc, &buf[..n], shared).await {
+                    if let Err(e) = feed_bytes(&mut cdc, &buf[..n], shared).await {
                         warn!("TT_DEBUG write failed: {}", classify(e));
                         break;
                     }
@@ -145,7 +210,7 @@ pub async fn run(
                     break;
                 }
                 Either::Second(line) => {
-                    if let Err(e) = write_log_line(&mut cdc, &line).await {
+                    if let Err(e) = wline(&mut cdc, line.as_bytes()).await {
                         warn!("TT_DEBUG log write failed: {}", classify(e));
                         break;
                     }
@@ -156,162 +221,249 @@ pub async fn run(
     }
 }
 
-// ── Input handling ────────────────────────────────────────────────
+// ── Line reader ───────────────────────────────────────────────────
 
-async fn handle_input(
-    cdc: &mut Cdc,
-    data: &[u8],
-    shared: &'static SharedState,
-) -> Result<(), EndpointError> {
+/// Accumulate input bytes into the line buffer, echoing for interactive use.
+/// On CR/LF the completed line is dispatched.
+async fn feed_bytes(cdc: &mut Cdc, data: &[u8], shared: &'static SharedState) -> Result<(), EndpointError> {
     for &b in data {
-        let state = unsafe { &mut CMD_STATE };
-        match state {
-            CmdState::Idle => {
-                match b {
-                    // Commands that take arguments — start accumulating
-                    b't' | b'T' | b'n' | b'd' => {
-                        unsafe {
-                            CMD_STATE = CmdState::Accumulating { cmd: b, pos: 0 };
-                        }
-                        write_chunked(cdc, core::slice::from_ref(&b)).await?;
-                    }
-                    b'N' => {
-                        unsafe {
-                            CMD_STATE = CmdState::Accumulating { cmd: b'N', pos: 0 };
-                        }
-                        write_chunked(cdc, b"N").await?;
-                    }
-                    // Immediate commands
-                    b'p' | b'P' => {
-                        write_chunked(cdc, b"\r\nOK TX\r\n").await?;
-                        let frame = debug_test_frame();
-                        crate::host::submit_tx_from_debug(shared, &frame).await;
-                        write_chunked(cdc, b"OK\r\n").await?;
-                    }
-                    b's' | b'S' => {
-                        write_chunked(cdc, b"\r\n").await?;
-                        let status = pio_status(shared);
-                        write_chunked(cdc, status.as_bytes()).await?;
-                        write_chunked(cdc, b"---\r\n").await?;
-                    }
-                    b'c' | b'C' => {
-                        crate::core1::clear_counters();
-                        write_chunked(cdc, b"\r\nCOUNTERS CLEARED\r\n").await?;
-                    }
-                    b'm' | b'M' => {
-                        let prev = MONITOR_ENABLED.load(Ordering::Relaxed);
-                        MONITOR_ENABLED.store(!prev, Ordering::Relaxed);
-                        if prev {
-                            write_chunked(cdc, b"\r\nMONITOR OFF\r\n").await?;
-                        } else {
-                            write_chunked(cdc, b"\r\nMONITOR ON\r\n").await?;
-                        }
-                    }
-                    b'a' | b'A' => {
-                        let prev = ANALYZER_MODE.load(Ordering::Relaxed);
-                        ANALYZER_MODE.store(!prev, Ordering::Relaxed);
-                        if prev {
-                            write_chunked(cdc, b"\r\nANALYZER OFF\r\n").await?;
-                        } else {
-                            write_chunked(cdc, b"\r\nANALYZER ON\r\n").await?;
-                        }
-                    }
-                    b'f' | b'F' => {
-                        write_chunked(cdc, b"\r\n").await?;
-                        cmd_dump_rx(cdc).await?;
-                    }
-                    b'i' | b'I' => {
-                        let serial = crate::usb_dev::serial();
-                        write_chunked(cdc, b"\r\nID:").await?;
-                        write_chunked(cdc, serial.as_bytes()).await?;
-                        write_chunked(cdc, b"\r\n").await?;
-                    }
-                    b'b' | b'B' => {
-                        write_chunked(cdc, b"\r\nBOOTSEL\r\n").await?;
-                        embassy_time::Timer::after_millis(50).await;
-                        embassy_rp::rom_data::reset_to_usb_boot(0, 0);
-                    }
-                    b'?' => {
-                        write_chunked(cdc, HELP).await?;
-                    }
-                    b'\r' | b'\n' => {
-                        write_chunked(cdc, b"\r\n").await?;
-                    }
-                    _ => {
-                        write_chunked(cdc, core::slice::from_ref(&b)).await?;
+        match b {
+            b'\r' | b'\n' => {
+                wline(cdc, b"").await?; // echo the newline
+                let len = unsafe { LINE_LEN };
+                unsafe { LINE_LEN = 0 };
+                if len > 0 {
+                    let line = unsafe { &LINE_BUF[..len] };
+                    match core::str::from_utf8(line) {
+                        Ok(s) => handle_line(cdc, shared, s).await?,
+                        Err(_) => reply_err(cdc, "badinput", "non-utf8").await?,
                     }
                 }
             }
-            CmdState::Accumulating { cmd, pos } => {
-                if b == b'\r' || b == b'\n' {
-                    write_chunked(cdc, b"\r\n").await?;
-                    let cmd_byte = *cmd;
-                    let len = *pos;
-                    unsafe { CMD_STATE = CmdState::Idle; }
-                    let line = unsafe { &CMD_BUF[..len] };
-                    dispatch_cmd(cdc, shared, cmd_byte, line).await?;
-                } else if *pos < CMD_BUF_SIZE {
-                    unsafe { CMD_BUF[*pos] = b; }
-                    *pos += 1;
+            0x08 | 0x7F => {
+                // Backspace / delete.
+                unsafe {
+                    if LINE_LEN > 0 {
+                        LINE_LEN -= 1;
+                        let _ = write_chunked(cdc, b"\x08 \x08").await;
+                    }
+                }
+            }
+            _ => unsafe {
+                if LINE_LEN < LINE_BUF_SIZE {
+                    LINE_BUF[LINE_LEN] = b;
+                    LINE_LEN += 1;
                     write_chunked(cdc, core::slice::from_ref(&b)).await?;
                 }
-                // else: overflow, silently drop extra bytes
-            }
+                // else: line overflow, silently drop until CR
+            },
         }
     }
     Ok(())
 }
 
-/// Dispatch an accumulated command.
-async fn dispatch_cmd(
-    cdc: &mut Cdc,
-    shared: &'static SharedState,
-    cmd: u8,
-    args: &[u8],
-) -> Result<(), EndpointError> {
-    // Strip leading spaces
-    let args = strip_leading(args, b' ');
-
-    match cmd {
-        b't' | b'T' => cmd_tx_raw(cdc, shared, args).await,
-        b'n' => cmd_set_node(cdc, shared, args, true).await,
-        b'N' => cmd_set_node(cdc, shared, args, false).await,
-        b'd' => cmd_directed(cdc, shared, args).await,
-        _ => {
-            write_chunked(cdc, b"ERR:unknown\r\n").await
+/// Tokenise, resolve the verb, and dispatch.
+async fn handle_line(cdc: &mut Cdc, shared: &'static SharedState, line: &str) -> Result<(), EndpointError> {
+    let mut tokens: Vec<&str, MAX_TOKENS> = Vec::new();
+    for t in line.split_ascii_whitespace() {
+        if tokens.push(t).is_err() {
+            break;
         }
+    }
+    let Some(&verb) = tokens.first() else {
+        return Ok(()); // blank line
+    };
+
+    let Some((cmd, inject)) = resolve(verb) else {
+        return reply_err(cdc, "unknown", verb).await;
+    };
+
+    // Build the argument list, prepending any injected alias argument.
+    let mut args: Vec<&str, MAX_TOKENS> = Vec::new();
+    if let Some(x) = inject {
+        let _ = args.push(x);
+    }
+    for &t in &tokens[1..] {
+        if args.push(t).is_err() {
+            break;
+        }
+    }
+
+    dispatch(cdc, shared, cmd, &args).await
+}
+
+async fn dispatch(cdc: &mut Cdc, shared: &'static SharedState, cmd: Cmd, args: &[&str]) -> Result<(), EndpointError> {
+    match cmd {
+        Cmd::Help => cmd_help(cdc, args).await,
+        Cmd::Status => cmd_status(cdc, shared).await,
+        Cmd::Clear => cmd_clear(cdc).await,
+        Cmd::Monitor => cmd_toggle(cdc, &MONITOR_ENABLED, "monitor", args).await,
+        Cmd::Analyzer => cmd_toggle(cdc, &ANALYZER_MODE, "analyzer", args).await,
+        Cmd::Frames => cmd_frames(cdc).await,
+        Cmd::Id => cmd_id(cdc).await,
+        Cmd::Tx => cmd_tx_raw(cdc, shared, args).await,
+        Cmd::Directed => cmd_directed(cdc, shared, args).await,
+        Cmd::Node => cmd_node(cdc, shared, args).await,
+        Cmd::TestFrame => cmd_testframe(cdc, shared).await,
+        Cmd::Bootsel => cmd_bootsel(cdc).await,
     }
 }
 
 // ── Command implementations ───────────────────────────────────────
 
-/// `t AABB..` — TX raw hex frame via CSMA
-async fn cmd_tx_raw(
-    cdc: &mut Cdc,
-    shared: &'static SharedState,
-    hex: &[u8],
-) -> Result<(), EndpointError> {
-    let Some(()) = parse_hex_to_buf(hex) else {
-        return write_chunked(cdc, b"ERR:bad hex\r\n").await;
-    };
-    let len = frame_len();
-    if len < 5 || len > 605 {
-        return write_chunked(cdc, b"ERR:bad len\r\n").await;
+async fn cmd_help(cdc: &mut Cdc, args: &[&str]) -> Result<(), EndpointError> {
+    use core::fmt::Write;
+    // `help <cmd>` — usage for one command.
+    if let Some(&verb) = args.first() {
+        if let Some((cmd, _)) = resolve(verb) {
+            for ci in COMMANDS {
+                if ci.cmd == cmd {
+                    let mut s = heapless::String::<128>::new();
+                    let _ = write!(s, "# {} {}", ci.name, ci.usage);
+                    wline(cdc, s.as_bytes()).await?;
+                    return reply_ok(cdc).await;
+                }
+            }
+        }
+        return reply_err(cdc, "unknown", verb).await;
     }
-    let frame_slice = frame_slice_ref();
-    crate::host::submit_tx_from_debug(shared, frame_slice).await;
-    write_chunked(cdc, b"OK\r\n").await
+    // Full table.
+    wline(cdc, b"# commands:").await?;
+    for ci in COMMANDS {
+        let mut s = heapless::String::<128>::new();
+        let alias = if ci.alias != 0 { ci.alias } else { b' ' };
+        let _ = write!(s, "#  {:<9} [{}] {:<14} {}", ci.name, alias as char, ci.usage, ci.summary);
+        wline(cdc, s.as_bytes()).await?;
+    }
+    reply_ok(cdc).await
 }
 
-/// `n XX` / `N XX` — set or clear node ID in bitmap
-async fn cmd_set_node(
-    cdc: &mut Cdc,
-    shared: &'static SharedState,
-    hex: &[u8],
-    set: bool,
-) -> Result<(), EndpointError> {
-    let Some(node_id) = parse_hex_byte(hex) else {
-        return write_chunked(cdc, b"ERR:bad hex\r\n").await;
+async fn cmd_status(cdc: &mut Cdc, shared: &'static SharedState) -> Result<(), EndpointError> {
+    let status = pio_status(shared);
+    write_chunked(cdc, status.as_bytes()).await?;
+    reply_ok(cdc).await
+}
+
+async fn cmd_clear(cdc: &mut Cdc) -> Result<(), EndpointError> {
+    crate::core1::clear_counters();
+    reply_ok(cdc).await
+}
+
+/// `monitor`/`analyzer` — toggle, or set explicitly with `on`/`off`.
+async fn cmd_toggle(cdc: &mut Cdc, flag: &AtomicBool, key: &str, args: &[&str]) -> Result<(), EndpointError> {
+    let next = match args.first() {
+        None => !flag.load(Ordering::Relaxed),
+        Some(&"on") => true,
+        Some(&"off") => false,
+        Some(_) => return reply_err(cdc, "badarg", "expected on|off").await,
+    };
+    flag.store(next, Ordering::Relaxed);
+    reply_ok_kv(cdc, key, if next { "on" } else { "off" }).await
+}
+
+async fn cmd_frames(cdc: &mut Cdc) -> Result<(), EndpointError> {
+    let count = unsafe { RX_LOG_COUNT };
+    let write_idx = unsafe { RX_LOG_WRITE };
+
+    let start = if count < RX_LOG_SLOTS { 0 } else { write_idx };
+
+    let mut hex_buf = [0u8; 132]; // "RX: " + 64*2 + CRLF
+    for i in 0..count {
+        let idx = (start + i) % RX_LOG_SLOTS;
+        let len = unsafe { RX_LOG_LENS[idx] } as usize;
+        let stored = len.min(RX_LOG_BYTES);
+        let frame = unsafe { &RX_LOG[idx][..stored] };
+
+        let mut pos = 0;
+        for &c in b"RX: " {
+            hex_buf[pos] = c;
+            pos += 1;
+        }
+        for &b in frame {
+            hex_buf[pos] = hex_char(b >> 4);
+            pos += 1;
+            hex_buf[pos] = hex_char(b & 0xF);
+            pos += 1;
+        }
+        wline(cdc, &hex_buf[..pos]).await?;
+    }
+
+    unsafe {
+        RX_LOG_COUNT = 0;
+        RX_LOG_WRITE = 0;
+    }
+
+    reply_ok_u32(cdc, "count", count as u32).await
+}
+
+async fn cmd_id(cdc: &mut Cdc) -> Result<(), EndpointError> {
+    reply_ok_kv(cdc, "serial", crate::usb_dev::serial()).await
+}
+
+/// `tx <hex>...` — TX raw hex frame (incl CRC) via CSMA.
+async fn cmd_tx_raw(cdc: &mut Cdc, shared: &'static SharedState, args: &[&str]) -> Result<(), EndpointError> {
+    if parse_hex_tokens(args).is_none() {
+        return reply_err(cdc, "badhex", "odd/invalid hex").await;
+    }
+    let len = frame_len();
+    if !(5..=605).contains(&len) {
+        return reply_err(cdc, "badlen", "want 5..605 bytes").await;
+    }
+    crate::host::submit_tx_from_debug(shared, frame_slice_ref()).await;
+    reply_ok(cdc).await
+}
+
+/// `directed <dest> <hex>...` — build a DDP short frame with CRC and use the
+/// RTS/CTS dialog.
+async fn cmd_directed(cdc: &mut Cdc, shared: &'static SharedState, args: &[&str]) -> Result<(), EndpointError> {
+    if args.len() < 2 {
+        return reply_err(cdc, "usage", "directed <dest> <hex>").await;
+    }
+    let Some(dest) = parse_hex_byte(args[0].as_bytes()) else {
+        return reply_err(cdc, "baddest", "dest hex").await;
+    };
+    if parse_hex_tokens(&args[1..]).is_none() {
+        return reply_err(cdc, "badhex", "payload hex").await;
+    }
+    let payload_len = frame_len();
+
+    let src = unsafe { LOCAL_NODES.iter().next().unwrap_or(1) };
+
+    // LLAP data frame: [dest, src, type=0x01 (DDP short), payload..., CRC]
+    let mut frame_buf = [0u8; 610];
+    frame_buf[0] = dest;
+    frame_buf[1] = src;
+    frame_buf[2] = 0x01;
+    let payload = frame_slice_ref();
+    let total_data = 3 + payload_len;
+    frame_buf[3..total_data].copy_from_slice(&payload[..payload_len]);
+    let crc = lt_crc(&frame_buf[..total_data]);
+    frame_buf[total_data] = crc[0];
+    frame_buf[total_data + 1] = crc[1];
+    let total = total_data + 2;
+
+    crate::host::submit_tx_from_debug(shared, &frame_buf[..total]).await;
+
+    let flags = shared.flags.load(Ordering::Relaxed);
+    if flags & crate::core1::TX_RESULT_FAIL != 0 {
+        reply_err(cdc, "timeout", "no CTS").await
+    } else {
+        reply_ok_kv(cdc, "dest", args[0]).await
+    }
+}
+
+/// `node <set|clr> <id>` — set or clear a node ID in the auto-reply bitmap.
+async fn cmd_node(cdc: &mut Cdc, shared: &'static SharedState, args: &[&str]) -> Result<(), EndpointError> {
+    if args.len() < 2 {
+        return reply_err(cdc, "usage", "node <set|clr> <id>").await;
+    }
+    let set = match args[0] {
+        "set" | "on" => true,
+        "clr" | "clear" | "off" => false,
+        _ => return reply_err(cdc, "badarg", "set|clr").await,
+    };
+    let Some(node_id) = parse_hex_byte(args[1].as_bytes()) else {
+        return reply_err(cdc, "badid", "id hex").await;
     };
     unsafe {
         if set {
@@ -321,127 +473,97 @@ async fn cmd_set_node(
         }
         crate::host::update_nodes(shared, LOCAL_NODES.as_bytes());
     }
-    // Wait for core 1 to acknowledge the bitmap update.
-    // NODES_UPDATED flag is cleared by core 1 after it copies the bitmap.
+    // Wait for core 1 to acknowledge the bitmap update (clears NODES_UPDATED).
     let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(100);
     while shared.flags.load(Ordering::Relaxed) & crate::core1::NODES_UPDATED != 0 {
-        if embassy_time::Instant::now() >= deadline { break; }
+        if embassy_time::Instant::now() >= deadline {
+            break;
+        }
         embassy_time::Timer::after_micros(10).await;
     }
-    if set {
-        write_chunked(cdc, b"NODE SET\r\n").await
-    } else {
-        write_chunked(cdc, b"NODE CLR\r\n").await
-    }
+    reply_ok_kv(cdc, "node", if set { "set" } else { "clr" }).await
 }
 
-/// `d XX AABB..` — directed data TX (builds frame with CRC, uses RTS/CTS)
-async fn cmd_directed(
-    cdc: &mut Cdc,
-    shared: &'static SharedState,
-    args: &[u8],
-) -> Result<(), EndpointError> {
-    // Parse: first 2 hex chars = dest node, then space, then payload hex
-    if args.len() < 3 {
-        return write_chunked(cdc, b"ERR:need dest+payload\r\n").await;
-    }
-    let Some(dest) = parse_hex_byte(&args[..2]) else {
-        return write_chunked(cdc, b"ERR:bad dest hex\r\n").await;
-    };
-    let payload_hex = strip_leading(&args[2..], b' ');
-    let Some(_) = parse_hex_to_buf(payload_hex) else {
-        return write_chunked(cdc, b"ERR:bad payload hex\r\n").await;
-    };
-    let payload_len = frame_len();
-
-    // Find our source node from bitmap
-    let src = unsafe { LOCAL_NODES.iter().next().unwrap_or(1) };
-
-    // Build LLAP data frame: [dest, src, type=0x01, length_hi, length_lo, payload..., CRC]
-    // DDP Short header: type=0x01, then 2 bytes length (of DDP data including header)
-    let mut frame_buf = [0u8; 610];
-    frame_buf[0] = dest;
-    frame_buf[1] = src;
-    frame_buf[2] = 0x01; // DDP short
-    // Copy payload after the 3-byte LLAP header
-    let payload_slice = frame_slice_ref();
-    let total_data = 3 + payload_len; // LLAP header + payload
-    frame_buf[3..3 + payload_len].copy_from_slice(&payload_slice[..payload_len]);
-    // Compute and append CRC
-    let crc = lt_crc(&frame_buf[..total_data]);
-    frame_buf[total_data] = crc[0];
-    frame_buf[total_data + 1] = crc[1];
-    let total = total_data + 2;
-
-    crate::host::submit_tx_from_debug(shared, &frame_buf[..total]).await;
-
-    // Check result
-    let flags = shared.flags.load(Ordering::Relaxed);
-    if flags & crate::core1::TX_RESULT_FAIL != 0 {
-        write_chunked(cdc, b"DIR TIMEOUT\r\n").await
-    } else {
-        write_chunked(cdc, b"DIR OK\r\n").await
-    }
+async fn cmd_testframe(cdc: &mut Cdc, shared: &'static SharedState) -> Result<(), EndpointError> {
+    let frame = debug_test_frame();
+    crate::host::submit_tx_from_debug(shared, &frame).await;
+    reply_ok(cdc).await
 }
 
-/// `f` — dump buffered RX frames
-async fn cmd_dump_rx(cdc: &mut Cdc) -> Result<(), EndpointError> {
-    let count = unsafe { RX_LOG_COUNT };
-    let write_idx = unsafe { RX_LOG_WRITE };
-
-    if count == 0 {
-        return write_chunked(cdc, b"END\r\n").await;
-    }
-
-    let start = if count < RX_LOG_SLOTS {
-        0
-    } else {
-        write_idx // oldest is at write_idx (wrapped)
-    };
-
-    let mut hex_buf = [0u8; 132]; // "RX:" + 64 bytes * 2 + "\r\n"
-    for i in 0..count {
-        let idx = (start + i) % RX_LOG_SLOTS;
-        let len = unsafe { RX_LOG_LENS[idx] } as usize;
-        let stored = len.min(RX_LOG_BYTES);
-        let frame = unsafe { &RX_LOG[idx][..stored] };
-
-        let mut pos = 0;
-        hex_buf[pos] = b'R'; pos += 1;
-        hex_buf[pos] = b'X'; pos += 1;
-        hex_buf[pos] = b':'; pos += 1;
-        for &b in frame {
-            hex_buf[pos] = hex_char(b >> 4); pos += 1;
-            hex_buf[pos] = hex_char(b & 0xF); pos += 1;
-        }
-        hex_buf[pos] = b'\r'; pos += 1;
-        hex_buf[pos] = b'\n'; pos += 1;
-        write_chunked(cdc, &hex_buf[..pos]).await?;
-    }
-
-    // Clear buffer
-    unsafe {
-        RX_LOG_COUNT = 0;
-        RX_LOG_WRITE = 0;
-    }
-
-    write_chunked(cdc, b"END\r\n").await
+async fn cmd_bootsel(cdc: &mut Cdc) -> Result<(), EndpointError> {
+    reply_ok(cdc).await?;
+    embassy_time::Timer::after_millis(50).await;
+    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+    Ok(())
 }
 
-// ── Helpers ───────────────────────────────────────────────────────
+// ── Response helpers (unified output format) ──────────────────────
+
+/// Write one line followed by CRLF (line-atomic on the CDC pipe).
+async fn wline(cdc: &mut Cdc, data: &[u8]) -> Result<(), EndpointError> {
+    write_chunked(cdc, data).await?;
+    write_chunked(cdc, b"\r\n").await
+}
+
+async fn reply_ok(cdc: &mut Cdc) -> Result<(), EndpointError> {
+    wline(cdc, b"OK").await
+}
+
+async fn reply_ok_kv(cdc: &mut Cdc, key: &str, val: &str) -> Result<(), EndpointError> {
+    use core::fmt::Write;
+    let mut s = heapless::String::<128>::new();
+    let _ = write!(s, "OK {}={}", key, val);
+    wline(cdc, s.as_bytes()).await
+}
+
+async fn reply_ok_u32(cdc: &mut Cdc, key: &str, val: u32) -> Result<(), EndpointError> {
+    use core::fmt::Write;
+    let mut s = heapless::String::<64>::new();
+    let _ = write!(s, "OK {}={}", key, val);
+    wline(cdc, s.as_bytes()).await
+}
+
+async fn reply_err(cdc: &mut Cdc, code: &str, msg: &str) -> Result<(), EndpointError> {
+    use core::fmt::Write;
+    let mut s = heapless::String::<128>::new();
+    let _ = write!(s, "ERR {} {}", code, msg);
+    wline(cdc, s.as_bytes()).await
+}
+
+async fn write_banner(cdc: &mut Cdc) -> Result<(), EndpointError> {
+    use core::fmt::Write;
+    let mut s = heapless::String::<160>::new();
+    let ms = embassy_time::Instant::now().as_millis();
+    let _ = write!(s, "# TASHTALK-PICO {} serial={} uptime={}ms", BUILD_ID, crate::usb_dev::serial(), ms);
+    wline(cdc, s.as_bytes()).await?;
+    wline(cdc, b"# type 'help' for commands").await?;
+    reply_ok(cdc).await
+}
+
+// ── Hex / parsing helpers ─────────────────────────────────────────
 
 fn debug_test_frame() -> [u8; 10] {
     let mut f = [0u8; 10];
-    f[0] = 0x42; f[1] = 0x01; f[2] = 0x01;
-    f[3] = 0x00; f[4] = 0x05; f[5] = 0xDE;
-    f[6] = 0x00; f[7] = 0xAD;
+    f[0] = 0x42;
+    f[1] = 0x01;
+    f[2] = 0x01;
+    f[3] = 0x00;
+    f[4] = 0x05;
+    f[5] = 0xDE;
+    f[6] = 0x00;
+    f[7] = 0xAD;
     let crc = lt_crc(&f[..8]);
-    f[8] = crc[0]; f[9] = crc[1];
+    f[8] = crc[0];
+    f[9] = crc[1];
     f
 }
 
 fn hex_char(nibble: u8) -> u8 {
-    if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 }
+    if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'A' + nibble - 10
+    }
 }
 
 fn hex_val(c: u8) -> Option<u8> {
@@ -453,26 +575,31 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
-/// Parse hex string into the shared FRAME_BUF. Returns Some(()) on success.
-/// Use frame_len() and frame_slice_ref() to access the result.
+// Shared frame parse buffer (single-core-0 access).
 static mut FRAME_BUF: [u8; 610] = [0u8; 610];
 static mut FRAME_BUF_LEN: usize = 0;
 
-fn parse_hex_to_buf(hex: &[u8]) -> Option<()> {
-    // Skip spaces
-    let hex = strip_leading(hex, b' ');
-    if hex.len() % 2 != 0 { return None; }
-    let byte_count = hex.len() / 2;
-    if byte_count > 610 { return None; }
-    unsafe {
-        FRAME_BUF_LEN = 0;
-        for i in 0..byte_count {
-            let hi = hex_val(hex[i * 2])?;
-            let lo = hex_val(hex[i * 2 + 1])?;
-            FRAME_BUF[i] = (hi << 4) | lo;
+/// Parse one or more whitespace-separated hex tokens into [`FRAME_BUF`].
+/// Each token must contain an even number of hex digits. Returns None on any
+/// invalid digit, odd-length token, or overflow.
+fn parse_hex_tokens(tokens: &[&str]) -> Option<()> {
+    let mut len = 0usize;
+    for tok in tokens {
+        let bytes = tok.as_bytes();
+        if bytes.len() % 2 != 0 {
+            return None;
         }
-        FRAME_BUF_LEN = byte_count;
+        for pair in bytes.chunks_exact(2) {
+            if len >= 610 {
+                return None;
+            }
+            let hi = hex_val(pair[0])?;
+            let lo = hex_val(pair[1])?;
+            unsafe { FRAME_BUF[len] = (hi << 4) | lo };
+            len += 1;
+        }
     }
+    unsafe { FRAME_BUF_LEN = len };
     Some(())
 }
 
@@ -485,49 +612,33 @@ fn frame_slice_ref() -> &'static [u8] {
 }
 
 fn parse_hex_byte(hex: &[u8]) -> Option<u8> {
-    let hex = strip_leading(hex, b' ');
-    if hex.len() < 2 { return None; }
+    if hex.len() < 2 {
+        return None;
+    }
     let hi = hex_val(hex[0])?;
     let lo = hex_val(hex[1])?;
     Some((hi << 4) | lo)
 }
 
-fn strip_leading(data: &[u8], ch: u8) -> &[u8] {
-    let mut i = 0;
-    while i < data.len() && data[i] == ch { i += 1; }
-    &data[i..]
-}
+// ── CDC I/O ───────────────────────────────────────────────────────
 
 async fn write_chunked(cdc: &mut Cdc, data: &[u8]) -> Result<(), EndpointError> {
     for chunk in data.chunks(64) {
-        match embassy_futures::select::select(
-            cdc.write_packet(chunk),
-            embassy_time::Timer::after_millis(100),
-        )
-        .await
-        {
-            embassy_futures::select::Either::First(r) => r?,
-            embassy_futures::select::Either::Second(()) => {
-                return Err(EndpointError::Disabled);
-            }
+        match select(cdc.write_packet(chunk), embassy_time::Timer::after_millis(100)).await {
+            Either::First(r) => r?,
+            Either::Second(()) => return Err(EndpointError::Disabled),
         }
     }
     Ok(())
 }
 
-async fn write_log_line(cdc: &mut Cdc, line: &LogLine) -> Result<(), EndpointError> {
-    write_chunked(cdc, line.as_bytes()).await?;
-    write_chunked(cdc, b"\r\n").await?;
-    Ok(())
-}
+// ── Status report ─────────────────────────────────────────────────
 
 fn pio_status(shared: &SharedState) -> heapless::String<768> {
     use core::fmt::Write;
     use embassy_rp::pac;
 
     let mut s = heapless::String::<768>::new();
-    let ms = embassy_time::Instant::now().as_millis();
-    let _ = write!(s, "[{:06}] status\r\n", ms);
 
     let pio1_ctrl = pac::PIO1.ctrl().read();
     let gpio_in = pac::SIO.gpio_in(0).read();
@@ -539,16 +650,16 @@ fn pio_status(shared: &SharedState) -> heapless::String<768> {
     let sm0_pc = pac::PIO1.sm(0).addr().read().addr();
     let gp4_pad = pac::PADS_BANK0.gpio(4).read();
     let gp4_ctrl = pac::IO_BANK0.gpio(4).ctrl().read();
-    let _ = write!(s, "PIO1: sm_en={:04b} sm0_pc={} GP4(RX)={} GP5(CS)={}\r\n",
+    let _ = write!(s, "STAT pio1 sm_en={:04b} sm0_pc={} gp4={} gp5={}\r\n",
         pio1_ctrl.sm_enable(), sm0_pc, (gpio_in >> 4) & 1, (gpio_in >> 5) & 1);
-    let _ = write!(s, "GP4: funcsel={} ie={} od={} pue={} pde={}\r\n",
+    let _ = write!(s, "STAT gp4 funcsel={} ie={} od={} pue={} pde={}\r\n",
         gp4_ctrl.funcsel() as u8, gp4_pad.ie() as u8, gp4_pad.od() as u8,
         gp4_pad.pue() as u8, gp4_pad.pde() as u8);
-    let _ = write!(s, "Flags: 0x{:02x} alive={} rxrdy={} txsub={}\r\n",
+    let _ = write!(s, "STAT flags 0x{:02x} alive={} rxrdy={} txsub={}\r\n",
         flags, (flags >> 5) & 1, (flags >> 3) & 1, flags & 1);
     let loop_count = unsafe { crate::core1::LOOP_COUNT };
-    let _ = write!(s, "DMA: en={} widx={} ridx={} remain={}\r\n", en, widx, ridx, remain);
-    let _ = write!(s, "Core1: loops={}\r\n", loop_count);
+    let _ = write!(s, "STAT dma en={} widx={} ridx={} remain={}\r\n", en, widx, ridx, remain);
+    let _ = write!(s, "STAT core1 loops={}\r\n", loop_count);
 
     let good = unsafe { crate::core1::GOOD_CRC_COUNT };
     let bad = unsafe { crate::core1::BAD_CRC_COUNT };
@@ -561,23 +672,18 @@ fn pio_status(shared: &SharedState) -> heapless::String<768> {
     let echo_skip = unsafe { crate::core1::ECHO_SKIP_COUNT };
     let bad_real = unsafe { crate::core1::BAD_REAL_COUNT };
 
-    let _ = write!(s, "Recv: good={} bad={} bad_real={} ar={} echo={} overrun={}\r\n",
+    let _ = write!(s, "STAT recv good={} bad={} bad_real={} ar={} echo={} overrun={}\r\n",
         good, bad, bad_real, ar, echo_skip, overruns);
-    let _ = write!(s, "Send: dir_att={} cts_ok={} tmo={} dir_rx={}\r\n",
+    let _ = write!(s, "STAT send dir_att={} cts_ok={} tmo={} dir_rx={}\r\n",
         dir_att, dir_cts, dir_tmo, dir_rx);
 
     let cts_start = unsafe { crate::core1::LAST_CTS_WAIT_START };
     let cts_end = unsafe { crate::core1::LAST_CTS_WAIT_END };
     let cts_entries = unsafe { crate::core1::LAST_CTS_ENTRIES };
     if cts_start > 0 {
-        let _ = write!(s, "CTS wait: {}us, {} entries\r\n",
+        let _ = write!(s, "STAT cts_wait us={} entries={}\r\n",
             cts_end.saturating_sub(cts_start), cts_entries);
     }
-    // Raw debug counters removed — using old edge timer PIO.
-    let raw_flags = 0u32;
-    let raw_words = [0u32; 4];
-    let _ = write!(s, "Raw: flags={} w=[{:08X} {:08X} {:08X} {:08X}]\r\n",
-        raw_flags, raw_words[0], raw_words[1], raw_words[2], raw_words[3]);
 
     s
 }
