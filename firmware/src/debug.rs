@@ -106,6 +106,7 @@ enum Cmd {
     Stack,
     Wifi,
     Ip,
+    Bridge,
     Bootsel,
 }
 
@@ -134,6 +135,7 @@ static COMMANDS: &[CmdInfo] = &[
     CmdInfo { cmd: Cmd::Stack, name: "stack", alias: 0, usage: "", summary: "core-1 stack high-water mark" },
     CmdInfo { cmd: Cmd::Wifi, name: "wifi", alias: 0, usage: "[add|del|list] ...", summary: "WiFi networks" },
     CmdInfo { cmd: Cmd::Ip, name: "ip", alias: 0, usage: "", summary: "show IP address" },
+    CmdInfo { cmd: Cmd::Bridge, name: "bridge", alias: 0, usage: "[on|off]", summary: "LToUDP bridge status/toggle" },
     CmdInfo { cmd: Cmd::Bootsel, name: "bootsel", alias: b'b', usage: "", summary: "reboot to BOOTSEL" },
 ];
 
@@ -341,6 +343,7 @@ async fn dispatch(cdc: &mut Cdc, shared: &'static SharedState, cmd: Cmd, args: &
         Cmd::Stack => cmd_stack(cdc).await,
         Cmd::Wifi => cmd_wifi(cdc, args).await,
         Cmd::Ip => cmd_ip(cdc).await,
+        Cmd::Bridge => cmd_bridge(cdc, args).await,
         Cmd::Bootsel => cmd_bootsel(cdc).await,
     }
 }
@@ -618,6 +621,34 @@ async fn cmd_ip(cdc: &mut Cdc) -> Result<(), EndpointError> {
     }
     wline(cdc, b"STAT ip addr=(none)").await?;
     reply_ok(cdc).await
+}
+
+async fn cmd_bridge(cdc: &mut Cdc, args: &[&str]) -> Result<(), EndpointError> {
+    use core::fmt::Write;
+    match args.first().copied() {
+        Some("on") => {
+            crate::bridge::set_enabled(true);
+            reply_ok_kv(cdc, "bridge", "on").await
+        }
+        Some("off") => {
+            crate::bridge::set_enabled(false);
+            reply_ok_kv(cdc, "bridge", "off").await
+        }
+        _ => {
+            let en = if crate::bridge::is_enabled() { "on" } else { "off" };
+            let mut s = heapless::String::<128>::new();
+            let _ = write!(
+                s,
+                "STAT bridge={} egress={} ingress={} drop={}",
+                en,
+                crate::bridge::egress_count(),
+                crate::bridge::ingress_count(),
+                crate::bridge::drop_count(),
+            );
+            wline(cdc, s.as_bytes()).await?;
+            reply_ok(cdc).await
+        }
+    }
 }
 
 async fn cmd_bootsel(cdc: &mut Cdc) -> Result<(), EndpointError> {

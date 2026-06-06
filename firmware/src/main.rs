@@ -43,6 +43,7 @@ mod debug;
 mod tt_log;
 mod usb_dev;
 mod wifi;
+mod bridge;
 
 pub type SharedNodes = Mutex<ThreadModeRawMutex, NodeBitmap>;
 pub type SharedBackoff = Mutex<ThreadModeRawMutex, BackoffState>;
@@ -151,6 +152,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(debug::run(debug_cdc, &SHARED).unwrap());
     spawner.spawn(host::run(data_cdc, &SHARED).unwrap());
     spawner.spawn(rx_bridge_task(&SHARED).unwrap());
+    spawner.spawn(bridge::bridge_task(&SHARED).unwrap());
 
     // ── WiFi init (async — runs on this task) ───────────────────────
     wifi::init(
@@ -187,6 +189,7 @@ async fn rx_bridge_task(shared: &'static core1::SharedState) {
             host::try_forward_inbound(&slot.buf[..len], status);
             let crc_ok = matches!(status, FrameStatus::Good);
             debug::log_rx_frame(&slot.buf[..len], crc_ok);
+            bridge::try_forward_to_udp(&slot.buf[..len], crc_ok);
             shared.flags.fetch_and(!core1::RX_READY, Ordering::Release);
         } else {
             Timer::after_micros(50).await;
