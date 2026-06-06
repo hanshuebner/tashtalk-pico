@@ -58,7 +58,14 @@ pub async fn run(
     let mut sink = HostSink { shared };
 
     loop {
-        cdc.wait_connection().await;
+        // Wait for a stable connection (see debug.rs for rationale).
+        loop {
+            cdc.wait_connection().await;
+            embassy_time::Timer::after_millis(200).await;
+            if cdc.dtr() {
+                break;
+            }
+        }
         defmt::info!("TT_DATA: host connected");
         tt_log!("TT_DATA: host connected");
         parser.reset();

@@ -193,7 +193,16 @@ pub async fn run(mut cdc: Cdc, shared: &'static SharedState) -> ! {
 
     let mut buf = [0u8; 64];
     loop {
-        cdc.wait_connection().await;
+        // Wait for a stable connection: after DTR goes high, require it to
+        // stay up for 200ms before proceeding.  USB enumeration can toggle
+        // DTR several times in quick succession, causing banner/log spam.
+        loop {
+            cdc.wait_connection().await;
+            embassy_time::Timer::after_millis(200).await;
+            if cdc.dtr() {
+                break;
+            }
+        }
         info!("TT_DEBUG: host connected");
         unsafe { LINE_LEN = 0 };
 

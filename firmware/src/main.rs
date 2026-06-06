@@ -95,7 +95,7 @@ bind_interrupts!(struct Irqs {
 // faults silently. `paint_core1_stack` fills it with a sentinel at boot and
 // the `stack` debug command reports the high-water mark. See
 // `docs/debug-cli-plan.md` and the RAM notes in `docs/ltoudp-design.md`.
-const CORE1_STACK_SIZE: usize = 65536;
+const CORE1_STACK_SIZE: usize = 8192;
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 
 /// Sentinel word used to paint the core-1 stack for high-water measurement.
