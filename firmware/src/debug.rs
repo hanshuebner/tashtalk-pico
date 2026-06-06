@@ -355,15 +355,29 @@ async fn cmd_help(cdc: &mut Cdc, args: &[&str]) -> Result<(), EndpointError> {
     for ci in COMMANDS {
         let mut s = heapless::String::<128>::new();
         let alias = if ci.alias != 0 { ci.alias } else { b' ' };
-        let _ = write!(s, "#  {:<9} [{}] {:<14} {}", ci.name, alias as char, ci.usage, ci.summary);
+        let _ = write!(s, "#  {:<9} [{}] {:<20} {}", ci.name, alias as char, ci.usage, ci.summary);
         wline(cdc, s.as_bytes()).await?;
     }
     reply_ok(cdc).await
 }
 
 async fn cmd_status(cdc: &mut Cdc, shared: &'static SharedState) -> Result<(), EndpointError> {
+    use core::fmt::Write;
     let status = pio_status(shared);
     write_chunked(cdc, status.as_bytes()).await?;
+    // WiFi status.
+    let wifi_state = crate::wifi::state_str();
+    let ssid = crate::wifi::ssid();
+    let mut s = heapless::String::<128>::new();
+    let _ = write!(s, "STAT wifi state={} ssid={}", wifi_state, if ssid.is_empty() { "(none)" } else { ssid });
+    wline(cdc, s.as_bytes()).await?;
+    if let Some(stack) = crate::wifi::stack() {
+        if let Some(config) = stack.config_v4() {
+            let mut s = heapless::String::<64>::new();
+            let _ = write!(s, "STAT wifi ip={}", config.address);
+            wline(cdc, s.as_bytes()).await?;
+        }
+    }
     reply_ok(cdc).await
 }
 

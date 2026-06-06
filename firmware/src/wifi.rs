@@ -5,6 +5,8 @@
 //! - `net_task`: drives the smoltcp network stack
 //! - `wifi_task`: joins WiFi and handles reconnection
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use cyw43::JoinOptions;
 use cyw43_pio::PioSpi;
 use defmt::{info, warn};
@@ -16,6 +18,29 @@ use embassy_rp::Peri;
 use static_cell::StaticCell;
 
 use crate::localtalk::phy::Pio0Remainder;
+
+// ── WiFi state tracking ────────────────────────────────────────────
+
+const STATE_INIT: u8 = 0;
+const STATE_FW_LOADING: u8 = 1;
+const STATE_FW_LOADED: u8 = 2;
+const STATE_JOINING: u8 = 3;
+const STATE_CONNECTED: u8 = 4;
+const STATE_DISCONNECTED: u8 = 5;
+
+static WIFI_STATE: AtomicU8 = AtomicU8::new(STATE_INIT);
+
+pub fn state_str() -> &'static str {
+    match WIFI_STATE.load(Ordering::Relaxed) {
+        STATE_INIT => "init",
+        STATE_FW_LOADING => "fw-loading",
+        STATE_FW_LOADED => "ready",
+        STATE_JOINING => "joining",
+        STATE_CONNECTED => "connected",
+        STATE_DISCONNECTED => "disconnected",
+        _ => "unknown",
+    }
+}
 
 // ── Firmware blobs (included at compile time) ──────────────────────
 
@@ -109,10 +134,14 @@ async fn wifi_task(mut control: cyw43::Control<'static>) -> ! {
         }
 
         info!("WiFi: joining '{}'", ssid);
+        WIFI_STATE.store(STATE_JOINING, Ordering::Relaxed);
+        tt_log!("WiFi: joining...");
         let opts = JoinOptions::new(pass.as_bytes());
         match control.join(ssid, opts).await {
             Ok(()) => {
                 info!("WiFi: joined '{}'", ssid);
+                WIFI_STATE.store(STATE_CONNECTED, Ordering::Relaxed);
+                tt_log!("WiFi: connected");
                 // Stay connected — if the connection drops, cyw43 will
                 // report it and we'll loop back to rejoin.
                 // For now, just wait and let the net stack handle DHCP.
@@ -123,6 +152,8 @@ async fn wifi_task(mut control: cyw43::Control<'static>) -> ! {
             }
             Err(e) => {
                 warn!("WiFi: join failed: {}", e);
+                WIFI_STATE.store(STATE_DISCONNECTED, Ordering::Relaxed);
+                tt_log!("WiFi: join failed");
                 embassy_time::Timer::after_secs(5).await;
             }
         }
@@ -148,6 +179,8 @@ pub async fn init(
     dma_ch2: Peri<'static, DMA_CH2>,
 ) {
     info!("WiFi: initializing CYW43");
+    WIFI_STATE.store(STATE_FW_LOADING, Ordering::Relaxed);
+    tt_log!("WiFi: loading firmware...");
 
     // Power pin (active high) — directly consumed by cyw43::new().
     let pwr = Output::new(pin_23, Level::Low);
@@ -158,6 +191,7 @@ pub async fn init(
     // PIO SPI transport — uses PIO0 SM1 (SM0 is LocalTalk TX).
     let Pio0Remainder { mut common, sm1, irq0 } = pio0_rem;
     let dma_ch = dma::Channel::new(dma_ch2, DmaIrqs);
+    tt_log!("WiFi: PIO SPI setup...");
     let spi = PioSpi::new(
         &mut common,
         sm1,
@@ -168,6 +202,7 @@ pub async fn init(
         pin_29, // CLK
         dma_ch,
     );
+    tt_log!("WiFi: PIO SPI ready, loading fw...");
 
     // Initialize CYW43 driver.
     let state = CYW43_STATE.init(cyw43::State::new());
@@ -178,7 +213,9 @@ pub async fn init(
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
+    WIFI_STATE.store(STATE_FW_LOADED, Ordering::Relaxed);
     info!("WiFi: CYW43 initialized");
+    tt_log!("WiFi: CYW43 ready");
 
     // Embassy-net stack with DHCP.
     let net_config = embassy_net::Config::dhcpv4(Default::default());
