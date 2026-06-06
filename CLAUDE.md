@@ -93,6 +93,10 @@ probe-rs read --chip RP2040 --protocol swd b32 <ADDRESS> 1
 
 Note: symbol addresses change between builds. Always re-run `nm` after rebuilding.
 
+For measuring RAM usage (static bss breakdown, core-1 stack high-water mark
+via the `stack` command or probe-rs, and shrinking the task arena), see
+`docs/measuring-ram.md`.
+
 ### AD2 (Analog Discovery 2)
 Bus scope tool in `tools/bus_scope.py`. Channel map in `tools/ad2.py`:
 DIO0=A, DIO1=B, DIO2=DI, DIO3=DE, DIO4=RE, DIO5=RO, DIO6=DBG0.
