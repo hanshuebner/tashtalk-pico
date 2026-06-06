@@ -241,12 +241,17 @@ async fn feed_bytes(cdc: &mut Cdc, data: &[u8], shared: &'static SharedState) ->
                 }
             }
             0x08 | 0x7F => {
-                // Backspace / delete.
-                unsafe {
-                    if LINE_LEN > 0 {
-                        LINE_LEN -= 1;
-                        let _ = write_chunked(cdc, b"\x08 \x08").await;
-                    }
+                // Backspace (BS) / delete (DEL) — erase one character.
+                if unsafe { LINE_LEN } > 0 {
+                    unsafe { LINE_LEN -= 1 };
+                    write_chunked(cdc, b"\x08 \x08").await?;
+                }
+            }
+            0x15 | 0x1B => {
+                // Ctrl-U / ESC — kill the whole line.
+                while unsafe { LINE_LEN } > 0 {
+                    unsafe { LINE_LEN -= 1 };
+                    write_chunked(cdc, b"\x08 \x08").await?;
                 }
             }
             _ => unsafe {
