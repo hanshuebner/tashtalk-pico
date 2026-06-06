@@ -123,35 +123,35 @@ async fn net_task(mut runner: NetRunner) -> ! {
 
 #[embassy_executor::task]
 async fn wifi_task(mut control: cyw43::Control<'static>) -> ! {
+    let mut join_failures: u32 = 0;
     loop {
         let (ssid, pass) = credentials();
         if ssid.is_empty() {
-            info!("WiFi: no SSID configured, waiting...");
+            join_failures = 0;
             embassy_time::Timer::after_secs(5).await;
             continue;
         }
 
-        info!("WiFi: joining '{}'", ssid);
         WIFI_STATE.store(STATE_JOINING, Ordering::Relaxed);
-        tt_log!("WiFi: joining...");
+        if join_failures == 0 {
+            tt_log!("WiFi: joining");
+        }
         let opts = JoinOptions::new(pass.as_bytes());
         match control.join(ssid, opts).await {
             Ok(()) => {
-                info!("WiFi: joined '{}'", ssid);
                 WIFI_STATE.store(STATE_CONNECTED, Ordering::Relaxed);
                 tt_log!("WiFi: connected");
-                // Stay connected — if the connection drops, cyw43 will
-                // report it and we'll loop back to rejoin.
-                // For now, just wait and let the net stack handle DHCP.
+                join_failures = 0;
                 loop {
                     embassy_time::Timer::after_secs(30).await;
-                    // TODO: check link state and break if disconnected
                 }
             }
-            Err(e) => {
-                warn!("WiFi: join failed: {}", e);
+            Err(_e) => {
                 WIFI_STATE.store(STATE_DISCONNECTED, Ordering::Relaxed);
-                tt_log!("WiFi: join failed");
+                if join_failures == 0 {
+                    tt_log!("WiFi: join failed, retrying");
+                }
+                join_failures += 1;
                 embassy_time::Timer::after_secs(5).await;
             }
         }
