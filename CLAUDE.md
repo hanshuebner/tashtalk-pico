@@ -176,3 +176,19 @@ ring → snap read pointer to write pointer.
 - `debug.rs`: Debug shell, analyzer mode, status reporting
 - `tt_log.rs`: Log channel macros
 - `usb_dev.rs`: USB descriptor setup
+
+## Future Work (design notes)
+
+Proposals, not yet implemented. See `docs/`:
+
+- `docs/ltoudp-spec.md`: LToUDP protocol spec (local transcription of the
+  now-login-gated windswept.home.blog post). Payload = `[sender_id:u32][LLAP
+  packet]`; packet carries NO SDLC framing and NO FCS/CRC. Multicast
+  `239.192.76.84:1954`. RTS/CTS never cross the bridge.
+- `docs/ltoudp-design.md`: Pico W LToUDP bridge plan. embassy-net + cyw43 on
+  core 0 alongside USB; flash/RAM/PIO/DMA/pins all fit. Key new concern is a
+  TX mux arbitrating USB + debug + bridge into core 1's single-writer TX.
+- `docs/debug-cli-plan.md`: debug.rs refactor — unified tagged output format
+  (`OK`/`ERR`/`STAT`/`RX:`), a `COMMANDS` table replacing the single-letter
+  match, a `Line` trait for CDC+telnet reuse, password-protected telnet on
+  Pico W. Steps 1–4 land without networking.
