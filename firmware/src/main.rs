@@ -90,7 +90,40 @@ bind_interrupts!(struct Irqs {
 });
 
 // ── Core 1 stack ────────────────────────────────────────────────────
-static mut CORE1_STACK: Stack<65536> = Stack::new(); // 64KB — testing stack overflow hypothesis
+// Currently 64KB. It is almost certainly oversized (all large core-1 buffers
+// are static), but it must be measured before shrinking — an undersized stack
+// faults silently. `paint_core1_stack` fills it with a sentinel at boot and
+// the `stack` debug command reports the high-water mark. See
+// `docs/debug-cli-plan.md` and the RAM notes in `docs/ltoudp-design.md`.
+const CORE1_STACK_SIZE: usize = 65536;
+static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
+
+/// Sentinel word used to paint the core-1 stack for high-water measurement.
+const CORE1_STACK_PAINT: u32 = 0xC1AC_57AC;
+
+/// Fill the core-1 stack with the sentinel word. MUST be called before
+/// `spawn_core1`, while core 1 is not yet touching the stack.
+fn paint_core1_stack() {
+    let words = CORE1_STACK_SIZE / 4;
+    let base = core::ptr::addr_of_mut!(CORE1_STACK) as *mut u32;
+    for i in 0..words {
+        unsafe { base.add(i).write_volatile(CORE1_STACK_PAINT) };
+    }
+}
+
+/// `(used_bytes, total_bytes)` for the core-1 stack. The stack grows downward
+/// from the top, so untouched sentinels accumulate at the low (deep) end;
+/// counting them gives the headroom. Reads run concurrently with core 1 — a
+/// benign race that is fine for a diagnostic.
+pub fn core1_stack_stats() -> (usize, usize) {
+    let words = CORE1_STACK_SIZE / 4;
+    let base = core::ptr::addr_of!(CORE1_STACK) as *const u32;
+    let mut unused = 0;
+    while unused < words && unsafe { base.add(unused).read_volatile() } == CORE1_STACK_PAINT {
+        unused += 1;
+    }
+    ((words - unused) * 4, words * 4)
+}
 
 // ── Shared state (inter-core) ───────────────────────────────────────
 static SHARED: core1::SharedState = core1::SharedState::new();
@@ -118,6 +151,7 @@ fn main() -> ! {
     info!("PHY: init_phy done");
 
     // ── Spawn core 1 (before starting executor) ─────────────────────
+    paint_core1_stack();
     embassy_rp::multicore::spawn_core1(
         p.CORE1,
         unsafe { &mut CORE1_STACK },

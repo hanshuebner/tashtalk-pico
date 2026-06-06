@@ -103,6 +103,7 @@ enum Cmd {
     Directed,
     Node,
     TestFrame,
+    Stack,
     Bootsel,
 }
 
@@ -128,6 +129,7 @@ static COMMANDS: &[CmdInfo] = &[
     CmdInfo { cmd: Cmd::Directed, name: "directed", alias: b'd', usage: "<dest> <hex>", summary: "directed TX (RTS/CTS dialog)" },
     CmdInfo { cmd: Cmd::Node, name: "node", alias: 0, usage: "<set|clr> <id>", summary: "set/clear node ID in bitmap" },
     CmdInfo { cmd: Cmd::TestFrame, name: "testframe", alias: b'p', usage: "", summary: "TX known test frame via CSMA" },
+    CmdInfo { cmd: Cmd::Stack, name: "stack", alias: 0, usage: "", summary: "core-1 stack high-water mark" },
     CmdInfo { cmd: Cmd::Bootsel, name: "bootsel", alias: b'b', usage: "", summary: "reboot to BOOTSEL" },
 ];
 
@@ -310,6 +312,7 @@ async fn dispatch(cdc: &mut Cdc, shared: &'static SharedState, cmd: Cmd, args: &
         Cmd::Directed => cmd_directed(cdc, shared, args).await,
         Cmd::Node => cmd_node(cdc, shared, args).await,
         Cmd::TestFrame => cmd_testframe(cdc, shared).await,
+        Cmd::Stack => cmd_stack(cdc).await,
         Cmd::Bootsel => cmd_bootsel(cdc).await,
     }
 }
@@ -487,6 +490,18 @@ async fn cmd_node(cdc: &mut Cdc, shared: &'static SharedState, args: &[&str]) ->
         embassy_time::Timer::after_micros(10).await;
     }
     reply_ok_kv(cdc, "node", if set { "set" } else { "clr" }).await
+}
+
+/// `stack` — report the core-1 stack high-water mark. Run a representative
+/// workload (e.g. an AFP session) first, then read this to size the stack
+/// down safely. The stack is sentinel-painted at boot in `main.rs`.
+async fn cmd_stack(cdc: &mut Cdc) -> Result<(), EndpointError> {
+    use core::fmt::Write;
+    let (used, total) = crate::core1_stack_stats();
+    let mut s = heapless::String::<96>::new();
+    let _ = write!(s, "STAT core1_stack used={} free={} total={}", used, total - used, total);
+    wline(cdc, s.as_bytes()).await?;
+    reply_ok_u32(cdc, "used", used as u32).await
 }
 
 async fn cmd_testframe(cdc: &mut Cdc, shared: &'static SharedState) -> Result<(), EndpointError> {
