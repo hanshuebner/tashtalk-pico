@@ -104,6 +104,8 @@ enum Cmd {
     Node,
     TestFrame,
     Stack,
+    Wifi,
+    Ip,
     Bootsel,
 }
 
@@ -130,6 +132,8 @@ static COMMANDS: &[CmdInfo] = &[
     CmdInfo { cmd: Cmd::Node, name: "node", alias: 0, usage: "<set|clr> <id>", summary: "set/clear node ID in bitmap" },
     CmdInfo { cmd: Cmd::TestFrame, name: "testframe", alias: b'p', usage: "", summary: "TX known test frame via CSMA" },
     CmdInfo { cmd: Cmd::Stack, name: "stack", alias: 0, usage: "", summary: "core-1 stack high-water mark" },
+    CmdInfo { cmd: Cmd::Wifi, name: "wifi", alias: 0, usage: "[set <ssid> <pass>]", summary: "WiFi status / set credentials" },
+    CmdInfo { cmd: Cmd::Ip, name: "ip", alias: 0, usage: "", summary: "show IP address" },
     CmdInfo { cmd: Cmd::Bootsel, name: "bootsel", alias: b'b', usage: "", summary: "reboot to BOOTSEL" },
 ];
 
@@ -322,6 +326,8 @@ async fn dispatch(cdc: &mut Cdc, shared: &'static SharedState, cmd: Cmd, args: &
         Cmd::Node => cmd_node(cdc, shared, args).await,
         Cmd::TestFrame => cmd_testframe(cdc, shared).await,
         Cmd::Stack => cmd_stack(cdc).await,
+        Cmd::Wifi => cmd_wifi(cdc, args).await,
+        Cmd::Ip => cmd_ip(cdc).await,
         Cmd::Bootsel => cmd_bootsel(cdc).await,
     }
 }
@@ -516,6 +522,49 @@ async fn cmd_stack(cdc: &mut Cdc) -> Result<(), EndpointError> {
 async fn cmd_testframe(cdc: &mut Cdc, shared: &'static SharedState) -> Result<(), EndpointError> {
     let frame = debug_test_frame();
     crate::host::submit_tx_from_debug(shared, &frame).await;
+    reply_ok(cdc).await
+}
+
+async fn cmd_wifi(cdc: &mut Cdc, args: &[&str]) -> Result<(), EndpointError> {
+    use core::fmt::Write;
+    if args.first() == Some(&"set") {
+        if args.len() < 3 {
+            return reply_err(cdc, "usage", "wifi set <ssid> <pass>").await;
+        }
+        crate::wifi::set_credentials(args[1], args[2]);
+        let mut s = heapless::String::<64>::new();
+        let _ = write!(s, "OK ssid={}", args[1]);
+        return wline(cdc, s.as_bytes()).await;
+    }
+    // Status: show current SSID.
+    let ssid = crate::wifi::ssid();
+    let mut s = heapless::String::<64>::new();
+    if ssid.is_empty() {
+        let _ = write!(s, "STAT wifi ssid=(none)");
+    } else {
+        let _ = write!(s, "STAT wifi ssid={}", ssid);
+    }
+    wline(cdc, s.as_bytes()).await?;
+    reply_ok(cdc).await
+}
+
+async fn cmd_ip(cdc: &mut Cdc) -> Result<(), EndpointError> {
+    use core::fmt::Write;
+    if let Some(stack) = crate::wifi::stack() {
+        if let Some(config) = stack.config_v4() {
+            let addr = config.address;
+            let mut s = heapless::String::<64>::new();
+            let _ = write!(s, "STAT ip addr={}", addr);
+            wline(cdc, s.as_bytes()).await?;
+            if let Some(gw) = config.gateway {
+                let mut s = heapless::String::<64>::new();
+                let _ = write!(s, "STAT ip gw={}", gw);
+                wline(cdc, s.as_bytes()).await?;
+            }
+            return reply_ok(cdc).await;
+        }
+    }
+    wline(cdc, b"STAT ip addr=(none)").await?;
     reply_ok(cdc).await
 }
 

@@ -42,6 +42,7 @@ mod debug;
 #[macro_use]
 mod tt_log;
 mod usb_dev;
+mod wifi;
 
 pub type SharedNodes = Mutex<ThreadModeRawMutex, NodeBitmap>;
 pub type SharedBackoff = Mutex<ThreadModeRawMutex, BackoffState>;
@@ -136,9 +137,9 @@ fn main() -> ! {
     let p = embassy_rp::init(Default::default());
     info!("tashtalk-pico booting (dual-core)");
 
-    // ── LocalTalk PHY (configures PIO + pins, drops handles) ────────
+    // ── LocalTalk PHY (configures PIO + pins) ────────────────────────
     info!("PHY: init_phy starting");
-    localtalk::phy::init_phy(
+    let pio0_remainder = localtalk::phy::init_phy(
         p.PIO0,
         localtalk::phy::Pio0Irqs {},
         p.PIO1,
@@ -163,6 +164,16 @@ fn main() -> ! {
     let driver = Driver::new(p.USB, Irqs);
     let (usb_run, data_cdc, debug_cdc) = usb_dev::build(driver, p.FLASH);
 
+    // ── WiFi peripherals (Pico W: GP23/24/25/29 + DMA CH2) ──────────
+    let wifi_peripherals = (
+        pio0_remainder,
+        p.PIN_23,
+        p.PIN_25,
+        p.PIN_24,
+        p.PIN_29,
+        p.DMA_CH2,
+    );
+
     // ── Start Embassy executor on core 0 ────────────────────────────
     let executor0 = EXECUTOR0.init(Executor::new());
     executor0.run(|spawner| {
@@ -170,12 +181,27 @@ fn main() -> ! {
         spawner.spawn(debug::run(debug_cdc, &SHARED).unwrap());
         spawner.spawn(host::run(data_cdc, &SHARED).unwrap());
         spawner.spawn(rx_bridge_task(&SHARED).unwrap());
+        let (pio0_rem, pin_23, pin_25, pin_24, pin_29, dma_ch2) = wifi_peripherals;
+        spawner.spawn(wifi_init_task(spawner, pio0_rem, pin_23, pin_25, pin_24, pin_29, dma_ch2).unwrap());
     });
 }
 
 #[embassy_executor::task]
 async fn usb_run_task(mut usb: usb_dev::UsbDevice) {
     usb.run().await;
+}
+
+#[embassy_executor::task]
+async fn wifi_init_task(
+    spawner: embassy_executor::Spawner,
+    pio0_rem: localtalk::phy::Pio0Remainder,
+    pin_23: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_23>,
+    pin_25: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
+    pin_24: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_24>,
+    pin_29: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_29>,
+    dma_ch2: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH2>,
+) {
+    wifi::init(spawner, pio0_rem, pin_23, pin_25, pin_24, pin_29, dma_ch2).await;
 }
 
 /// Bridge: polls core 1's rx_slot and forwards frames to the host task.

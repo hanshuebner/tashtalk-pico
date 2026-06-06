@@ -4,13 +4,16 @@
 //! After init, core 1 accesses these via PAC — the Embassy HAL handles
 //! are leaked (mem::forget) to prevent Drop from disabling the SMs
 //! or resetting pin function selects.
+//!
+//! Returns unused PIO0 resources (common, SM1, IRQ0) for cyw43-pio.
 
 use core::mem;
 
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, PIO1};
 use embassy_rp::pio::{
-    Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig, ShiftDirection,
+    Common, Config, Direction, FifoJoin, InterruptHandler, Irq, Pio, PioPin, ShiftConfig,
+    ShiftDirection, StateMachine,
 };
 use embassy_rp::Peri;
 use fixed::types::U24F8;
@@ -34,6 +37,13 @@ const fn clock_div(target_hz: u32) -> U24F8 {
     U24F8::from_bits(div_x256 as u32)
 }
 
+/// Remaining PIO0 resources after LocalTalk TX init, for cyw43-pio.
+pub struct Pio0Remainder {
+    pub common: Common<'static, PIO0>,
+    pub sm1: StateMachine<'static, PIO0, 1>,
+    pub irq0: Irq<'static, PIO0, 0>,
+}
+
 /// Initialize PIO state machines and pin configuration.
 ///
 /// After this call:
@@ -41,9 +51,8 @@ const fn clock_div(target_hz: u32) -> U24F8 {
 /// - PIO1 SM0 is configured and ENABLED for continuous RX.
 /// - GP3 (DE) is configured as SIO output, driven low.
 ///
-/// All Embassy handles are leaked via `mem::forget` to prevent their
-/// Drop impls from disabling state machines or resetting pin function
-/// selects. Core 1 accesses hardware via PAC registers.
+/// Returns unused PIO0 resources (common, SM1, IRQ0) for cyw43-pio.
+/// PIO0 SM0 and all PIO1 handles are leaked via `mem::forget`.
 pub fn init_phy(
     pio0: Peri<'static, PIO0>,
     _pio0_irqs: Pio0Irqs,
@@ -53,12 +62,14 @@ pub fn init_phy(
     tx_en_pin: Peri<'static, impl embassy_rp::gpio::Pin>,
     rx_data_pin: Peri<'static, impl PioPin>,
     carrier_sense_pin: Peri<'static, impl PioPin>,
-) {
+) -> Pio0Remainder {
     // ── PIO0: SM0 (TX Data Shift-out) ──────────────────────────────
 
     let Pio {
         common: mut common0,
+        irq0,
         sm0: mut tx_sm,
+        sm1,
         ..
     } = Pio::new(pio0, Pio0Irqs {});
 
@@ -83,6 +94,10 @@ pub fn init_phy(
     tx_sm.set_config(&tx_data_cfg);
     tx_sm.set_pin_dirs(Direction::Out, &[&tx_data_pin_obj]);
     // SM0 left disabled — core 1 enables it per-TX.
+
+    // Leak TX SM — core 1 owns it via PAC. Do NOT leak common0 or sm1;
+    // they are returned for cyw43-pio use.
+    mem::forget(tx_sm);
 
     // ── GP3: TX Driver Enable (GPIO, not PIO) ──────────────────────
     let de = Output::new(tx_en_pin, Level::Low);
@@ -198,10 +213,10 @@ pub fn init_phy(
 
     rx_sm.set_enable(true);
 
-    // Leak all handles to prevent Drop from disabling SMs or resetting
-    // pin function selects. Core 1 owns the hardware via PAC.
-    mem::forget(tx_sm);
-    mem::forget(common0);
+    // Leak PIO1 handles — core 1 owns the hardware via PAC.
     mem::forget(rx_sm);
     mem::forget(common1);
+
+    // Return PIO0 resources for cyw43-pio.
+    Pio0Remainder { common: common0, sm1, irq0 }
 }
