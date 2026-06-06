@@ -132,7 +132,7 @@ static COMMANDS: &[CmdInfo] = &[
     CmdInfo { cmd: Cmd::Node, name: "node", alias: 0, usage: "<set|clr> <id>", summary: "set/clear node ID in bitmap" },
     CmdInfo { cmd: Cmd::TestFrame, name: "testframe", alias: b'p', usage: "", summary: "TX known test frame via CSMA" },
     CmdInfo { cmd: Cmd::Stack, name: "stack", alias: 0, usage: "", summary: "core-1 stack high-water mark" },
-    CmdInfo { cmd: Cmd::Wifi, name: "wifi", alias: 0, usage: "[set <ssid> <pass>]", summary: "WiFi status / set credentials" },
+    CmdInfo { cmd: Cmd::Wifi, name: "wifi", alias: 0, usage: "[add|del|list] ...", summary: "WiFi networks" },
     CmdInfo { cmd: Cmd::Ip, name: "ip", alias: 0, usage: "", summary: "show IP address" },
     CmdInfo { cmd: Cmd::Bootsel, name: "bootsel", alias: b'b', usage: "", summary: "reboot to BOOTSEL" },
 ];
@@ -380,7 +380,7 @@ async fn cmd_status(cdc: &mut Cdc, shared: &'static SharedState) -> Result<(), E
     write_chunked(cdc, status.as_bytes()).await?;
     // WiFi status.
     let wifi_state = crate::wifi::state_str();
-    let ssid = crate::wifi::ssid();
+    let ssid = crate::wifi::connected_ssid();
     let mut s = heapless::String::<128>::new();
     let _ = write!(s, "STAT wifi state={} ssid={}", wifi_state, if ssid.is_empty() { "(none)" } else { ssid });
     wline(cdc, s.as_bytes()).await?;
@@ -554,25 +554,50 @@ async fn cmd_testframe(cdc: &mut Cdc, shared: &'static SharedState) -> Result<()
 
 async fn cmd_wifi(cdc: &mut Cdc, args: &[&str]) -> Result<(), EndpointError> {
     use core::fmt::Write;
-    if args.first() == Some(&"set") {
-        if args.len() < 3 {
-            return reply_err(cdc, "usage", "wifi set <ssid> <pass>").await;
+    match args.first().copied() {
+        Some("add") => {
+            if args.len() < 3 {
+                return reply_err(cdc, "usage", "wifi add <ssid> <pass>").await;
+            }
+            if crate::wifi::add_network(args[1], args[2]) {
+                reply_ok_kv(cdc, "ssid", args[1]).await
+            } else {
+                reply_err(cdc, "full", "max 4 networks").await
+            }
         }
-        crate::wifi::set_credentials(args[1], args[2]);
-        let mut s = heapless::String::<64>::new();
-        let _ = write!(s, "OK ssid={}", args[1]);
-        return wline(cdc, s.as_bytes()).await;
+        Some("del") => {
+            if args.len() < 2 {
+                return reply_err(cdc, "usage", "wifi del <ssid>").await;
+            }
+            if crate::wifi::remove_network(args[1]) {
+                reply_ok_kv(cdc, "removed", args[1]).await
+            } else {
+                reply_err(cdc, "notfound", args[1]).await
+            }
+        }
+        Some("list") => {
+            let n = crate::wifi::network_count();
+            for i in 0..n {
+                let mut s = heapless::String::<64>::new();
+                let _ = write!(s, "STAT wifi[{}] ssid={}", i, crate::wifi::network_ssid(i));
+                wline(cdc, s.as_bytes()).await?;
+            }
+            reply_ok_u32(cdc, "count", n as u32).await
+        }
+        _ => {
+            // No subcommand: show status.
+            let state = crate::wifi::state_str();
+            let connected = crate::wifi::connected_ssid();
+            let mut s = heapless::String::<96>::new();
+            if connected.is_empty() {
+                let _ = write!(s, "STAT wifi state={} networks={}", state, crate::wifi::network_count());
+            } else {
+                let _ = write!(s, "STAT wifi state={} ssid={} networks={}", state, connected, crate::wifi::network_count());
+            }
+            wline(cdc, s.as_bytes()).await?;
+            reply_ok(cdc).await
+        }
     }
-    // Status: show current SSID.
-    let ssid = crate::wifi::ssid();
-    let mut s = heapless::String::<64>::new();
-    if ssid.is_empty() {
-        let _ = write!(s, "STAT wifi ssid=(none)");
-    } else {
-        let _ = write!(s, "STAT wifi ssid={}", ssid);
-    }
-    wline(cdc, s.as_bytes()).await?;
-    reply_ok(cdc).await
 }
 
 async fn cmd_ip(cdc: &mut Cdc) -> Result<(), EndpointError> {
