@@ -310,7 +310,7 @@ pub async fn init(
 
     control.init(CLM).await;
     control
-        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .set_power_management(cyw43::PowerManagementMode::None)
         .await;
 
     WIFI_STATE.store(STATE_FW_LOADED, Ordering::Relaxed);

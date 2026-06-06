@@ -25,6 +25,7 @@ use crate::core1::SharedState;
 
 const LTOUDP_PORT: u16 = 1954;
 const LTOUDP_GROUP: Ipv4Address = Ipv4Address::new(239, 192, 76, 84);
+const LTOUDP_BROADCAST: Ipv4Address = Ipv4Address::new(192, 168, 178, 255);
 /// Opaque sender ID embedded in every outgoing packet.
 /// 0 is fine for a single bare-metal speaker (per spec).
 const SENDER_ID: u32 = 0;
@@ -138,7 +139,9 @@ pub async fn bridge_task(shared: &'static SharedState) {
             );
             socket.bind(LTOUDP_PORT).unwrap();
 
-            let endpoint = (IpAddress::Ipv4(LTOUDP_GROUP), LTOUDP_PORT);
+            // Use broadcast for now — multicast TX may not work with CYW43.
+            // TODO: switch back to LTOUDP_GROUP once multicast TX is verified.
+            let endpoint = (IpAddress::Ipv4(LTOUDP_BROADCAST), LTOUDP_PORT);
 
             // Main bridge loop: select between egress and ingress.
             loop {

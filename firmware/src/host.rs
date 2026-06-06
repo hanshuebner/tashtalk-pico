@@ -67,7 +67,8 @@ pub async fn run(
             }
         }
         defmt::info!("TT_DATA: host connected");
-        tt_log!("TT_DATA: host connected");
+        // TT_DATA connection is logged via defmt only — tt_log here
+        // caused garbled output on the debug CDC during heavy traffic.
         parser.reset();
 
         loop {
@@ -165,7 +166,7 @@ async fn submit_tx(shared: &SharedState, frame: &[u8]) {
         slot.rts_fm0_len = 0;
     }
 
-    tt_log!("TX {} bytes d={:02x} s={:02x} t={:02x} dir={}",
+    defmt::debug!("TX {} bytes d={:02x} s={:02x} t={:02x} dir={}",
             frame.len(), slot.frame_dest, slot.frame_src,
             if frame.len() >= 3 { frame[2] } else { 0xFF },
             is_directed);
@@ -308,7 +309,7 @@ impl Sink for HostSink {
     }
 
     fn on_set_node_ids(&mut self, bitmap: &[u8; 32]) {
-        tt_log!("HOST: SetNodeIds");
+        defmt::info!("HOST: SetNodeIds");
         unsafe { PENDING_NODES = Some(*bitmap); }
     }
 
@@ -316,7 +317,7 @@ impl Sink for HostSink {
         use core::sync::atomic::AtomicU8;
         static FEATURES: AtomicU8 = AtomicU8::new(0);
         FEATURES.store(features, Ordering::Relaxed);
-        tt_log!("HOST: SetFeatures {:02x}", features);
+        defmt::info!("HOST: SetFeatures {:02x}", features);
     }
 }
 
