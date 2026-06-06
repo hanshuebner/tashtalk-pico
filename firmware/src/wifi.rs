@@ -232,7 +232,7 @@ async fn wifi_task(mut control: cyw43::Control<'static>) -> ! {
 
         if best_ssid.is_empty() {
             WIFI_STATE.store(STATE_DISCONNECTED, Ordering::Relaxed);
-            tt_log!("WiFi: no known network found");
+            info!("WiFi: no known network in scan");
             embassy_time::Timer::after_secs(10).await;
             continue;
         }
@@ -241,7 +241,7 @@ async fn wifi_task(mut control: cyw43::Control<'static>) -> ! {
         let pass = unsafe { WIFI_CONFIGS.passphrase_for(best_ssid.as_str()) }
             .unwrap_or("");
         WIFI_STATE.store(STATE_JOINING, Ordering::Relaxed);
-        tt_log!("WiFi: joining");
+        info!("WiFi: joining '{}'", best_ssid.as_str());
         let opts = JoinOptions::new(pass.as_bytes());
         match control.join(best_ssid.as_str(), opts).await {
             Ok(()) => {
@@ -250,7 +250,7 @@ async fn wifi_task(mut control: cyw43::Control<'static>) -> ! {
                     CONNECTED_SSID.clear();
                     let _ = CONNECTED_SSID.push_str(best_ssid.as_str());
                 }
-                tt_log!("WiFi: connected");
+                info!("WiFi: connected to '{}'", best_ssid.as_str());
                 // Stay connected. Re-scan if we lose the connection.
                 loop {
                     embassy_time::Timer::after_secs(30).await;
@@ -259,7 +259,7 @@ async fn wifi_task(mut control: cyw43::Control<'static>) -> ! {
             }
             Err(_e) => {
                 WIFI_STATE.store(STATE_DISCONNECTED, Ordering::Relaxed);
-                tt_log!("WiFi: join failed");
+                info!("WiFi: join failed");
                 embassy_time::Timer::after_secs(5).await;
             }
         }

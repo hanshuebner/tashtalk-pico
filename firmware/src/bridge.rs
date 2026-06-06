@@ -12,7 +12,7 @@
 
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
-use defmt::warn;
+use defmt::{info, warn};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpAddress, Ipv4Address};
 
@@ -122,7 +122,7 @@ pub async fn bridge_task(shared: &'static SharedState) {
             if let Err(_e) = stack.join_multicast_group(IpAddress::Ipv4(LTOUDP_GROUP)) {
                 warn!("bridge: failed to join multicast group");
             }
-            tt_log!("bridge: started");
+            info!("bridge: started");
 
             // Create UDP socket.
             let mut rx_meta = [PacketMetadata::EMPTY; 4];

@@ -394,6 +394,15 @@ async fn cmd_status(cdc: &mut Cdc, shared: &'static SharedState) -> Result<(), E
             wline(cdc, s.as_bytes()).await?;
         }
     }
+    // Bridge counters.
+    {
+        let en = if crate::bridge::is_enabled() { "on" } else { "off" };
+        let mut s = heapless::String::<96>::new();
+        let _ = write!(s, "STAT bridge={} eg={} in={} drop={}",
+            en, crate::bridge::egress_count(),
+            crate::bridge::ingress_count(), crate::bridge::drop_count());
+        wline(cdc, s.as_bytes()).await?;
+    }
     reply_ok(cdc).await
 }
 
@@ -662,8 +671,24 @@ async fn cmd_bootsel(cdc: &mut Cdc) -> Result<(), EndpointError> {
 
 /// Write one line followed by CRLF (line-atomic on the CDC pipe).
 async fn wline(cdc: &mut Cdc, data: &[u8]) -> Result<(), EndpointError> {
-    write_chunked(cdc, data).await?;
-    write_chunked(cdc, b"\r\n").await
+    // Write data + \r\n as a single contiguous stream so the line
+    // terminator is never separated from the line content by an
+    // executor yield.  For lines ≤62 bytes this is one USB packet.
+    if data.len() <= 62 {
+        let mut buf = [0u8; 64];
+        buf[..data.len()].copy_from_slice(data);
+        buf[data.len()] = b'\r';
+        buf[data.len() + 1] = b'\n';
+        let pkt = &buf[..data.len() + 2];
+        match select(cdc.write_packet(pkt), embassy_time::Timer::after_millis(100)).await {
+            Either::First(r) => r?,
+            Either::Second(()) => return Err(EndpointError::Disabled),
+        }
+        Ok(())
+    } else {
+        write_chunked(cdc, data).await?;
+        write_chunked(cdc, b"\r\n").await
+    }
 }
 
 async fn reply_ok(cdc: &mut Cdc) -> Result<(), EndpointError> {
