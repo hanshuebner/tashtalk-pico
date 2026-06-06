@@ -2,13 +2,12 @@
 
 ## Must fix
 
-- **Multicast TX**: `send_to(239.192.76.84:1954)` succeeds at the smoltcp
-  level but packets never appear on the wire. Broadcast (subnet .255) works.
-  Root cause unknown — could be CYW43 driver, smoltcp multicast routing, or
-  firmware blob limitation. Currently using broadcast as workaround.
-
-- **Broadcast address**: hardcoded to 192.168.178.255 — must be derived from
-  the DHCP-assigned subnet mask, or use the LToUDP spec's multicast group.
+- **Multicast TX**: CYW43 binary firmware blob silently drops multicast TX
+  frames. Confirmed: `send_to(multicast)` returns Ok at smoltcp level, Rust
+  driver sends frame to CYW43 via SPI without filtering, but firmware never
+  puts it on the air. Not documented anywhere upstream. Using subnet-directed
+  broadcast (derived from DHCP config via `Ipv4Cidr::broadcast()`) as the
+  LToUDP spec allows. All speakers on one segment must use the same mode.
 
 ## Should fix
 
