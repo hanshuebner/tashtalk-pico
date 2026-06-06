@@ -133,7 +133,7 @@ static COMMANDS: &[CmdInfo] = &[
     CmdInfo { cmd: Cmd::Node, name: "node", alias: 0, usage: "<set|clr> <id>", summary: "set/clear node ID in bitmap" },
     CmdInfo { cmd: Cmd::TestFrame, name: "testframe", alias: b'p', usage: "", summary: "TX known test frame via CSMA" },
     CmdInfo { cmd: Cmd::Stack, name: "stack", alias: 0, usage: "", summary: "core-1 stack high-water mark" },
-    CmdInfo { cmd: Cmd::Wifi, name: "wifi", alias: 0, usage: "[add|del|list] ...", summary: "WiFi networks" },
+    CmdInfo { cmd: Cmd::Wifi, name: "wifi", alias: 0, usage: "[add|del|list|save]", summary: "WiFi networks" },
     CmdInfo { cmd: Cmd::Ip, name: "ip", alias: 0, usage: "", summary: "show IP address" },
     CmdInfo { cmd: Cmd::Bridge, name: "bridge", alias: 0, usage: "[on|off]", summary: "LToUDP bridge status/toggle" },
     CmdInfo { cmd: Cmd::Bootsel, name: "bootsel", alias: b'b', usage: "", summary: "reboot to BOOTSEL" },
@@ -586,6 +586,11 @@ async fn cmd_wifi(cdc: &mut Cdc, args: &[&str]) -> Result<(), EndpointError> {
             } else {
                 reply_err(cdc, "notfound", args[1]).await
             }
+        }
+        Some("save") => {
+            wline(cdc, b"# saving to flash...").await?;
+            crate::wifi::save_config();
+            reply_ok(cdc).await
         }
         Some("list") => {
             let n = crate::wifi::network_count();

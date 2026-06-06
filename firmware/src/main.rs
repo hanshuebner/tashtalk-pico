@@ -44,6 +44,7 @@ mod tt_log;
 mod usb_dev;
 mod wifi;
 mod bridge;
+mod config;
 
 pub type SharedNodes = Mutex<ThreadModeRawMutex, NodeBitmap>;
 pub type SharedBackoff = Mutex<ThreadModeRawMutex, BackoffState>;
@@ -142,6 +143,23 @@ async fn main(spawner: Spawner) {
         move || core1::core1_main(&SHARED),
     );
     info!("Core 1 spawned");
+
+    // ── Flash config ──────────────────────────────────────────────────
+    {
+        use embassy_rp::flash::{Blocking, Flash};
+        let mut fl = Flash::<_, Blocking, { 2 * 1024 * 1024 }>::new_blocking(
+            unsafe { p.FLASH.clone_unchecked() }
+        );
+        let mut n = 0u32;
+        config::load(&mut fl, |ssid, pass| {
+            wifi::add_network(ssid, pass);
+            n += 1;
+        });
+        if n > 0 {
+            info!("loaded {} WiFi network(s) from flash", n);
+        }
+        config::init(fl);
+    }
 
     // ── USB ──────────────────────────────────────────────────────────
     let driver = Driver::new(p.USB, Irqs);

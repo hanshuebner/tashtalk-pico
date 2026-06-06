@@ -147,6 +147,17 @@ pub fn remove_network(ssid: &str) -> bool {
     unsafe { WIFI_CONFIGS.remove(ssid) }
 }
 
+/// Save current config to flash.
+pub fn save_config() {
+    let count = unsafe { WIFI_CONFIGS.count };
+    let mut pairs: heapless::Vec<(&str, &str), 4> = heapless::Vec::new();
+    for i in 0..count {
+        let e = unsafe { &WIFI_CONFIGS.entries[i] };
+        let _ = pairs.push((e.ssid.as_str(), e.pass.as_str()));
+    }
+    crate::config::save_config(&pairs);
+}
+
 /// Number of configured networks.
 pub fn network_count() -> usize {
     unsafe { WIFI_CONFIGS.count }
@@ -251,11 +262,14 @@ async fn wifi_task(mut control: cyw43::Control<'static>) -> ! {
                     let _ = CONNECTED_SSID.push_str(best_ssid.as_str());
                 }
                 info!("WiFi: connected to '{}'", best_ssid.as_str());
-                // Stay connected. Re-scan if we lose the connection.
-                loop {
-                    embassy_time::Timer::after_secs(30).await;
-                    // TODO: detect disconnection and break
+                // Wait until link drops, then re-scan.
+                if let Some(stack) = crate::wifi::stack() {
+                    stack.wait_link_down().await;
                 }
+                WIFI_STATE.store(STATE_DISCONNECTED, Ordering::Relaxed);
+                unsafe { CONNECTED_SSID.clear(); }
+                info!("WiFi: link lost, will re-scan");
+                embassy_time::Timer::after_secs(2).await;
             }
             Err(_e) => {
                 WIFI_STATE.store(STATE_DISCONNECTED, Ordering::Relaxed);
