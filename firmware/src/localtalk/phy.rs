@@ -40,7 +40,7 @@ const fn clock_div(target_hz: u32) -> U24F8 {
 /// Remaining PIO0 resources after LocalTalk TX init, for cyw43-pio.
 pub struct Pio0Remainder {
     pub common: Common<'static, PIO0>,
-    pub sm: StateMachine<'static, PIO0, 0>,  // TODO: should be SM1 once PIO sharing works
+    pub sm: StateMachine<'static, PIO0, 1>,
     pub irq0: Irq<'static, PIO0, 0>,
 }
 
@@ -218,7 +218,5 @@ pub fn init_phy(
     mem::forget(common1);
 
     // Return PIO0 resources for cyw43-pio.
-    // HACK: sm0 is consumed by TX; return sm1 cast as sm0 — this code path
-    // is currently not called (PHY init skipped for WiFi testing).
-    Pio0Remainder { common: common0, sm: unsafe { core::mem::transmute(sm1) }, irq0 }
+    Pio0Remainder { common: common0, sm: sm1, irq0 }
 }

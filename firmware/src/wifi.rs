@@ -104,7 +104,7 @@ pub fn stack() -> Option<&'static NetStack> {
 
 // ── Task type aliases ──────────────────────────────────────────────
 
-type Cyw43Spi = PioSpi<'static, PIO0, 0>;
+type Cyw43Spi = PioSpi<'static, PIO0, 1>;
 type Cyw43Bus = cyw43::SpiBus<Output<'static>, Cyw43Spi>;
 type Cyw43Runner = cyw43::Runner<'static, Cyw43Bus>;
 type NetRunner = embassy_net::Runner<'static, cyw43::NetDriver<'static>>;

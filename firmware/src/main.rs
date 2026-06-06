@@ -119,17 +119,19 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     info!("tashtalk-pico booting (dual-core)");
 
-    // ── LocalTalk PHY — TEMPORARILY DISABLED for WiFi debugging ──────
-    info!("PHY: SKIPPED for WiFi test");
-    let pio0_remainder = {
-        use embassy_rp::pio::Pio;
-        let pio = Pio::new(p.PIO0, localtalk::phy::Pio0Irqs {});
-        localtalk::phy::Pio0Remainder {
-            common: pio.common,
-            sm: pio.sm0,
-            irq0: pio.irq0,
-        }
-    };
+    // ── LocalTalk PHY (configures PIO + pins) ────────────────────────
+    info!("PHY: init_phy starting");
+    let pio0_remainder = localtalk::phy::init_phy(
+        p.PIO0,
+        localtalk::phy::Pio0Irqs {},
+        p.PIO1,
+        localtalk::phy::Pio1Irqs {},
+        p.PIN_2,
+        p.PIN_3,
+        p.PIN_4,
+        p.PIN_5,
+    );
+    info!("PHY: init_phy done");
 
     // ── Spawn core 1 (before any async work) ────────────────────────
     paint_core1_stack();
