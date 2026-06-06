@@ -213,8 +213,21 @@ pub async fn run(mut cdc: Cdc, shared: &'static SharedState) -> ! {
         let _ = write_banner(&mut cdc).await;
 
         loop {
+            // Try to deliver a pending log line without blocking.
+            // If none, block on CDC input. This ensures log lines are
+            // never written while input/command processing is in flight.
+            if let Ok(line) = LOG_CHANNEL.try_receive() {
+                if let Err(e) = wline(&mut cdc, line.as_bytes()).await {
+                    warn!("TT_DEBUG log write failed: {}", classify(e));
+                    break;
+                }
+                continue; // drain all pending before blocking for input
+            }
+            // No log pending — wait for either input or a new log line.
             match select(cdc.read_packet(&mut buf), LOG_CHANNEL.receive()).await {
                 Either::First(Ok(n)) => {
+                    // Process ALL bytes in this packet before delivering
+                    // any log lines — feed_bytes may echo + dispatch.
                     if let Err(e) = feed_bytes(&mut cdc, &buf[..n], shared).await {
                         warn!("TT_DEBUG write failed: {}", classify(e));
                         break;
