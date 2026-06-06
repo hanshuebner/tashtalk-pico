@@ -313,6 +313,14 @@ pub async fn init(
         .set_power_management(cyw43::PowerManagementMode::None)
         .await;
 
+    // Register the LToUDP multicast MAC with CYW43 firmware.
+    // MAC for 239.192.76.84 = 01:00:5e:40:4c:54
+    let mcast_mac = [0x01, 0x00, 0x5e, 0x40, 0x4c, 0x54];
+    match control.add_multicast_address(mcast_mac).await {
+        Ok(idx) => info!("WiFi: multicast MAC registered at slot {}", idx),
+        Err(_) => warn!("WiFi: failed to register multicast MAC"),
+    }
+
     WIFI_STATE.store(STATE_FW_LOADED, Ordering::Relaxed);
     info!("WiFi: CYW43 initialized");
     tt_log!("WiFi: ready");

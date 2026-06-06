@@ -2,13 +2,17 @@
 //!
 //! Wire → UDP (egress): good-CRC frames from the wire are stripped of FCS,
 //! filtered (no RTS/CTS), prepended with a sender ID, and sent as UDP
-//! multicast to 239.192.76.84:1954.
+//! broadcast to port 1954.
 //!
 //! UDP → Wire (ingress): received UDP packets are stripped of sender ID,
 //! checked for echo, CRC-appended, and submitted to the TX path for
 //! CSMA transmission on the physical bus.
 //!
 //! See `docs/ltoudp-spec.md` for the protocol specification.
+//!
+//! NOTE: The LToUDP spec prefers multicast (239.192.76.84) but the CYW43
+//! WiFi firmware silently drops multicast TX frames. We use subnet-directed
+//! broadcast instead, which the spec allows as an alternative.
 
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -24,8 +28,6 @@ use crate::core1::SharedState;
 // ── Constants ──────────────────────────────────────────────────────
 
 const LTOUDP_PORT: u16 = 1954;
-const LTOUDP_GROUP: Ipv4Address = Ipv4Address::new(239, 192, 76, 84);
-const LTOUDP_BROADCAST: Ipv4Address = Ipv4Address::new(192, 168, 178, 255);
 /// Opaque sender ID embedded in every outgoing packet.
 /// 0 is fine for a single bare-metal speaker (per spec).
 const SENDER_ID: u32 = 0;
@@ -104,6 +106,16 @@ pub fn try_forward_to_udp(frame: &[u8], crc_ok: bool) {
     }
 }
 
+/// Compute the subnet-directed broadcast address from the DHCP config.
+fn broadcast_addr(stack: &crate::wifi::NetStack) -> Ipv4Address {
+    if let Some(config) = stack.config_v4() {
+        // Ipv4Cidr::broadcast() returns the subnet broadcast.
+        config.address.broadcast().unwrap_or(Ipv4Address::BROADCAST)
+    } else {
+        Ipv4Address::BROADCAST
+    }
+}
+
 // ── Bridge task ────────────────────────────────────────────────────
 
 #[embassy_executor::task]
@@ -119,11 +131,9 @@ pub async fn bridge_task(shared: &'static SharedState) {
                 embassy_time::Timer::after_millis(500).await;
             }
 
-            // Join multicast group.
-            if let Err(_e) = stack.join_multicast_group(IpAddress::Ipv4(LTOUDP_GROUP)) {
-                warn!("bridge: failed to join multicast group");
-            }
             info!("bridge: started");
+
+            let bcast = broadcast_addr(stack);
 
             // Create UDP socket.
             let mut rx_meta = [PacketMetadata::EMPTY; 4];
@@ -139,9 +149,8 @@ pub async fn bridge_task(shared: &'static SharedState) {
             );
             socket.bind(LTOUDP_PORT).unwrap();
 
-            // Use broadcast for now — multicast TX may not work with CYW43.
-            // TODO: switch back to LTOUDP_GROUP once multicast TX is verified.
-            let endpoint = (IpAddress::Ipv4(LTOUDP_BROADCAST), LTOUDP_PORT);
+            // Use subnet-directed broadcast (CYW43 firmware drops multicast TX).
+            let endpoint = (IpAddress::Ipv4(bcast), LTOUDP_PORT);
 
             // Main bridge loop: select between egress and ingress.
             loop {
@@ -180,7 +189,6 @@ async fn recv_ingress(socket: &mut UdpSocket<'_>, shared: &'static SharedState) 
     socket
         .recv_from_with(|data, _meta| {
             if data.len() < 7 {
-                // Too short: need 4 sender_id + at least dest+src+type.
                 return;
             }
             let sender_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -199,9 +207,6 @@ async fn recv_ingress(socket: &mut UdpSocket<'_>, shared: &'static SharedState) 
             pkt_buf[packet.len()] = crc[0];
             pkt_buf[packet.len() + 1] = crc[1];
 
-            // Submit to TX (blocking try — cooperative executor serializes).
-            // We can't await inside recv_from_with, so use a sync path.
-            // Store frame for async submission after callback returns.
             unsafe {
                 INGRESS_FRAME_LEN = frame_len as u16;
                 INGRESS_FRAME_BUF[..frame_len].copy_from_slice(&pkt_buf[..frame_len]);
