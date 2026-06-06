@@ -44,10 +44,8 @@ pub fn state_str() -> &'static str {
 
 // ── Firmware blobs (included at compile time) ──────────────────────
 
-static FW: &cyw43::Aligned<cyw43::A4, [u8]> =
-    &cyw43::Aligned(*include_bytes!("../cyw43-fw/43439A0.bin"));
-static NVRAM: &cyw43::Aligned<cyw43::A4, [u8]> =
-    &cyw43::Aligned(*include_bytes!("../cyw43-fw/nvram_rp2040.bin"));
+static FW: &cyw43::Aligned<cyw43::A4, [u8]> = cyw43::aligned_bytes!("../cyw43-fw/43439A0.bin");
+static NVRAM: &cyw43::Aligned<cyw43::A4, [u8]> = cyw43::aligned_bytes!("../cyw43-fw/nvram_rp2040.bin");
 static CLM: &[u8] = include_bytes!("../cyw43-fw/43439A0_clm.bin");
 
 // ── WiFi credential storage ────────────────────────────────────────
@@ -106,7 +104,7 @@ pub fn stack() -> Option<&'static NetStack> {
 
 // ── Task type aliases ──────────────────────────────────────────────
 
-type Cyw43Spi = PioSpi<'static, PIO0, 1>;
+type Cyw43Spi = PioSpi<'static, PIO0, 0>;
 type Cyw43Bus = cyw43::SpiBus<Output<'static>, Cyw43Spi>;
 type Cyw43Runner = cyw43::Runner<'static, Cyw43Bus>;
 type NetRunner = embassy_net::Runner<'static, cyw43::NetDriver<'static>>;
@@ -176,7 +174,7 @@ pub async fn init(
     pin_25: Peri<'static, PIN_25>,
     pin_24: Peri<'static, PIN_24>,
     pin_29: Peri<'static, PIN_29>,
-    dma_ch2: Peri<'static, DMA_CH2>,
+    dma_ch: Peri<'static, DMA_CH2>,
 ) {
     info!("WiFi: initializing CYW43");
     WIFI_STATE.store(STATE_FW_LOADING, Ordering::Relaxed);
@@ -189,24 +187,30 @@ pub async fn init(
     let cs = Output::new(pin_25, Level::High);
 
     // PIO SPI transport — uses PIO0 SM1 (SM0 is LocalTalk TX).
-    let Pio0Remainder { mut common, sm1, irq0 } = pio0_rem;
-    let dma_ch = dma::Channel::new(dma_ch2, DmaIrqs);
+    let Pio0Remainder { mut common, sm, irq0 } = pio0_rem;
+    let dma_chan = dma::Channel::new(dma_ch, DmaIrqs);
     tt_log!("WiFi: PIO SPI setup...");
     let spi = PioSpi::new(
         &mut common,
-        sm1,
+        sm,
         cyw43_pio::DEFAULT_CLOCK_DIVIDER,
         irq0,
         cs,
         pin_24, // DIO
         pin_29, // CLK
-        dma_ch,
+        dma_chan,
     );
     tt_log!("WiFi: PIO SPI ready, loading fw...");
 
     // Initialize CYW43 driver.
     let state = CYW43_STATE.init(cyw43::State::new());
+    tt_log!("WiFi: calling cyw43::new...");
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, FW, NVRAM).await;
+    tt_log!("WiFi: cyw43::new returned!");
+
+    // Spawn the cyw43 runner BEFORE calling control.init() — the runner
+    // must be processing SPI commands for control ioctls to complete.
+    spawner.spawn(cyw43_task(runner).unwrap());
 
     control.init(CLM).await;
     control
@@ -228,8 +232,7 @@ pub async fn init(
 
     info!("WiFi: network stack ready");
 
-    // Spawn background tasks.
-    spawner.spawn(cyw43_task(runner).unwrap());
+    // Spawn remaining background tasks.
     spawner.spawn(net_task(net_runner).unwrap());
     spawner.spawn(wifi_task(control).unwrap());
 }

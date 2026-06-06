@@ -19,7 +19,7 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use defmt::info;
-use embassy_executor::Executor;
+use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::multicore::Stack;
 use embassy_rp::peripherals::USB;
@@ -49,30 +49,12 @@ pub type SharedBackoff = Mutex<ThreadModeRawMutex, BackoffState>;
 
 /// No-init RAM buffer for panic messages (survives soft reset).
 #[link_section = ".uninit.PANIC_BUF"]
-static mut PANIC_BUF: core::mem::MaybeUninit<[u8; 512]> =
-    core::mem::MaybeUninit::uninit();
+static mut PANIC_BUF: [u8; 256] = [0u8; 256];
 
-const PANIC_MARKER: &[u8] = b"\xDEPANIC_BUF\xDE ";
-
-#[panic_handler]
-fn panic_handler(info: &core::panic::PanicInfo) -> ! {
-    use core::fmt::Write;
-    let buf = unsafe { &mut *core::ptr::addr_of_mut!(PANIC_BUF).cast::<[u8; 512]>() };
-    for b in buf.iter_mut() { *b = 0; }
-    buf[..PANIC_MARKER.len()].copy_from_slice(PANIC_MARKER);
-    let mut w = SliceWriter { buf, pos: PANIC_MARKER.len() };
-    if let Some(loc) = info.location() {
-        let _ = write!(&mut w, "{}:{}:{} ", loc.file(), loc.line(), loc.column());
-    } else {
-        let _ = write!(&mut w, "<no location> ");
-    }
-    let _ = write!(&mut w, "msg=");
-    let _ = write!(&mut w, "{}", info);
-    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
-    loop { cortex_m::asm::nop(); }
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
 }
-
-struct SliceWriter<'a> { buf: &'a mut [u8], pos: usize }
 
 impl core::fmt::Write for SliceWriter<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -86,24 +68,29 @@ impl core::fmt::Write for SliceWriter<'_> {
     }
 }
 
+#[panic_handler]
+fn panic_handler(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write;
+    unsafe {
+        let buf = &mut *core::ptr::addr_of_mut!(PANIC_BUF);
+        let mut w = SliceWriter { buf, pos: 0 };
+        let _ = write!(w, "{}", info);
+    }
+    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+    loop {}
+}
+
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
 
 // ── Core 1 stack ────────────────────────────────────────────────────
-// Currently 64KB. It is almost certainly oversized (all large core-1 buffers
-// are static), but it must be measured before shrinking — an undersized stack
-// faults silently. `paint_core1_stack` fills it with a sentinel at boot and
-// the `stack` debug command reports the high-water mark. See
-// `docs/debug-cli-plan.md` and the RAM notes in `docs/ltoudp-design.md`.
 const CORE1_STACK_SIZE: usize = 8192;
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 
 /// Sentinel word used to paint the core-1 stack for high-water measurement.
 const CORE1_STACK_PAINT: u32 = 0xC1AC_57AC;
 
-/// Fill the core-1 stack with the sentinel word. MUST be called before
-/// `spawn_core1`, while core 1 is not yet touching the stack.
 fn paint_core1_stack() {
     let words = CORE1_STACK_SIZE / 4;
     let base = core::ptr::addr_of_mut!(CORE1_STACK) as *mut u32;
@@ -112,10 +99,6 @@ fn paint_core1_stack() {
     }
 }
 
-/// `(used_bytes, total_bytes)` for the core-1 stack. The stack grows downward
-/// from the top, so untouched sentinels accumulate at the low (deep) end;
-/// counting them gives the headroom. Reads run concurrently with core 1 — a
-/// benign race that is fine for a diagnostic.
 pub fn core1_stack_stats() -> (usize, usize) {
     let words = CORE1_STACK_SIZE / 4;
     let base = core::ptr::addr_of!(CORE1_STACK) as *const u32;
@@ -129,29 +112,26 @@ pub fn core1_stack_stats() -> (usize, usize) {
 // ── Shared state (inter-core) ───────────────────────────────────────
 static SHARED: core1::SharedState = core1::SharedState::new();
 
-// ── Executor ────────────────────────────────────────────────────────
-static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
+// ── Main ────────────────────────────────────────────────────────────
 
-#[cortex_m_rt::entry]
-fn main() -> ! {
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     info!("tashtalk-pico booting (dual-core)");
 
-    // ── LocalTalk PHY (configures PIO + pins) ────────────────────────
-    info!("PHY: init_phy starting");
-    let pio0_remainder = localtalk::phy::init_phy(
-        p.PIO0,
-        localtalk::phy::Pio0Irqs {},
-        p.PIO1,
-        localtalk::phy::Pio1Irqs {},
-        p.PIN_2,
-        p.PIN_3,
-        p.PIN_4,
-        p.PIN_5,
-    );
-    info!("PHY: init_phy done");
+    // ── LocalTalk PHY — TEMPORARILY DISABLED for WiFi debugging ──────
+    info!("PHY: SKIPPED for WiFi test");
+    let pio0_remainder = {
+        use embassy_rp::pio::Pio;
+        let pio = Pio::new(p.PIO0, localtalk::phy::Pio0Irqs {});
+        localtalk::phy::Pio0Remainder {
+            common: pio.common,
+            sm: pio.sm0,
+            irq0: pio.irq0,
+        }
+    };
 
-    // ── Spawn core 1 (before starting executor) ─────────────────────
+    // ── Spawn core 1 (before any async work) ────────────────────────
     paint_core1_stack();
     embassy_rp::multicore::spawn_core1(
         p.CORE1,
@@ -164,44 +144,28 @@ fn main() -> ! {
     let driver = Driver::new(p.USB, Irqs);
     let (usb_run, data_cdc, debug_cdc) = usb_dev::build(driver, p.FLASH);
 
-    // ── WiFi peripherals (Pico W: GP23/24/25/29 + DMA CH2) ──────────
-    let wifi_peripherals = (
+    // ── Spawn non-WiFi tasks ────────────────────────────────────────
+    spawner.spawn(usb_run_task(usb_run).unwrap());
+    spawner.spawn(debug::run(debug_cdc, &SHARED).unwrap());
+    spawner.spawn(host::run(data_cdc, &SHARED).unwrap());
+    spawner.spawn(rx_bridge_task(&SHARED).unwrap());
+
+    // ── WiFi init (async — runs on this task) ───────────────────────
+    wifi::init(
+        spawner,
         pio0_remainder,
         p.PIN_23,
         p.PIN_25,
         p.PIN_24,
         p.PIN_29,
         p.DMA_CH2,
-    );
-
-    // ── Start Embassy executor on core 0 ────────────────────────────
-    let executor0 = EXECUTOR0.init(Executor::new());
-    executor0.run(|spawner| {
-        spawner.spawn(usb_run_task(usb_run).unwrap());
-        spawner.spawn(debug::run(debug_cdc, &SHARED).unwrap());
-        spawner.spawn(host::run(data_cdc, &SHARED).unwrap());
-        spawner.spawn(rx_bridge_task(&SHARED).unwrap());
-        let (pio0_rem, pin_23, pin_25, pin_24, pin_29, dma_ch2) = wifi_peripherals;
-        spawner.spawn(wifi_init_task(spawner, pio0_rem, pin_23, pin_25, pin_24, pin_29, dma_ch2).unwrap());
-    });
+    )
+    .await;
 }
 
 #[embassy_executor::task]
 async fn usb_run_task(mut usb: usb_dev::UsbDevice) {
     usb.run().await;
-}
-
-#[embassy_executor::task]
-async fn wifi_init_task(
-    spawner: embassy_executor::Spawner,
-    pio0_rem: localtalk::phy::Pio0Remainder,
-    pin_23: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_23>,
-    pin_25: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
-    pin_24: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_24>,
-    pin_29: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_29>,
-    dma_ch2: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH2>,
-) {
-    wifi::init(spawner, pio0_rem, pin_23, pin_25, pin_24, pin_29, dma_ch2).await;
 }
 
 /// Bridge: polls core 1's rx_slot and forwards frames to the host task.
