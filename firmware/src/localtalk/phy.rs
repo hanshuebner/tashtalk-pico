@@ -12,7 +12,7 @@ use embassy_rp::peripherals::{PIO0, PIO1};
 use embassy_rp::pio::{
     Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig, ShiftDirection,
 };
-use embassy_rp::Peripheral;
+use embassy_rp::Peri;
 use fixed::types::U24F8;
 
 embassy_rp::bind_interrupts!(pub struct Pio0Irqs {
@@ -45,14 +45,14 @@ const fn clock_div(target_hz: u32) -> U24F8 {
 /// Drop impls from disabling state machines or resetting pin function
 /// selects. Core 1 accesses hardware via PAC registers.
 pub fn init_phy(
-    pio0: impl Peripheral<P = PIO0> + 'static,
+    pio0: Peri<'static, PIO0>,
     _pio0_irqs: Pio0Irqs,
-    pio1: impl Peripheral<P = PIO1> + 'static,
+    pio1: Peri<'static, PIO1>,
     _pio1_irqs: Pio1Irqs,
-    tx_data_pin: impl Peripheral<P = impl PioPin> + 'static,
-    tx_en_pin: impl Peripheral<P = impl embassy_rp::gpio::Pin> + 'static,
-    rx_data_pin: impl Peripheral<P = impl PioPin> + 'static,
-    carrier_sense_pin: impl Peripheral<P = impl PioPin> + 'static,
+    tx_data_pin: Peri<'static, impl PioPin>,
+    tx_en_pin: Peri<'static, impl embassy_rp::gpio::Pin>,
+    rx_data_pin: Peri<'static, impl PioPin>,
+    carrier_sense_pin: Peri<'static, impl PioPin>,
 ) {
     // ── PIO0: SM0 (TX Data Shift-out) ──────────────────────────────
 
@@ -62,7 +62,7 @@ pub fn init_phy(
         ..
     } = Pio::new(pio0, Pio0Irqs {});
 
-    let tx_data_prog = pio_proc::pio_asm!(
+    let tx_data_prog = pio::pio_asm!(
         ".wrap_target",
         "    out pins, 1",
         ".wrap",
@@ -117,7 +117,7 @@ pub fn init_phy(
     // Output: autopush every 8 decoded bits. Each FIFO word has one
     // byte of decoded FM-0 data in bits [31:24]. Frame-end marker
     // 0xFFFFFFFF is distinguishable (normal words have [23:0] = 0).
-    let rx_fm0_prog = pio_proc::pio_asm!(
+    let rx_fm0_prog = pio::pio_asm!(
         // One-time init: y = 0xFFFFFFFF. Bit 0 = 1 for `in y, 1`.
         "    mov y, !null",
 

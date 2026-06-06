@@ -107,14 +107,14 @@ pub fn assemble_tx_enable() -> PioProgram {
 
     // Phase 4: Done — disable TX, signal success
     a.set(SetDestination::PINS, 0);
-    a.irq(false, false, 1, false); // irq 1 (success)
+    a.irq(false, false, 1, pio::IrqIndexMode::DIRECT); // irq 1 (success)
     a.bind(&mut halt_ok);
     a.jmp(JmpCondition::Always, &mut halt_ok); // halt
 
     // Collision path
     a.bind(&mut collision);
     a.set(SetDestination::PINS, 0); // ensure TX off
-    a.irq(false, false, 2, false); // irq 2 (collision)
+    a.irq(false, false, 2, pio::IrqIndexMode::DIRECT); // irq 2 (collision)
     a.bind(&mut halt_col);
     a.jmp(JmpCondition::Always, &mut halt_col); // halt
 

@@ -14,6 +14,7 @@
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::peripherals::{FLASH, USB};
 use embassy_rp::usb::Driver;
+use embassy_rp::Peri;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::{Builder, Config};
 use static_cell::StaticCell;
@@ -38,7 +39,7 @@ pub fn serial() -> &'static str {
     unsafe { SERIAL_PTR.unwrap_or("") }
 }
 
-pub fn build(driver: Driver<'static, USB>, flash: FLASH) -> (UsbDevice, Cdc, Cdc) {
+pub fn build(driver: Driver<'static, USB>, flash: Peri<'static, FLASH>) -> (UsbDevice, Cdc, Cdc) {
     // Read the flash chip's unique ID to use as USB serial number.
     // This gives each Pico a distinct identity for udev symlinks.
     static SERIAL_BUF: StaticCell<[u8; 17]> = StaticCell::new();

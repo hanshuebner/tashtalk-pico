@@ -13,9 +13,9 @@ default = []
 defmt = ["dep:defmt"]
 
 [dependencies]
-defmt = { version = "0.3", optional = true }
-heapless = "0.8"
-pio = "0.2"
+defmt = { version = "1.1", optional = true }
+heapless = "0.9"
+pio = "0.3"
 
 [dev-dependencies]
-pio-proc = "0.2"
+pio-proc = "0.3"

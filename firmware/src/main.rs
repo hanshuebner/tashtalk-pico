@@ -166,10 +166,10 @@ fn main() -> ! {
     // ── Start Embassy executor on core 0 ────────────────────────────
     let executor0 = EXECUTOR0.init(Executor::new());
     executor0.run(|spawner| {
-        defmt::unwrap!(spawner.spawn(usb_run_task(usb_run)));
-        defmt::unwrap!(spawner.spawn(debug::run(debug_cdc, &SHARED)));
-        defmt::unwrap!(spawner.spawn(host::run(data_cdc, &SHARED)));
-        defmt::unwrap!(spawner.spawn(rx_bridge_task(&SHARED)));
+        spawner.spawn(usb_run_task(usb_run).unwrap());
+        spawner.spawn(debug::run(debug_cdc, &SHARED).unwrap());
+        spawner.spawn(host::run(data_cdc, &SHARED).unwrap());
+        spawner.spawn(rx_bridge_task(&SHARED).unwrap());
     });
 }
 

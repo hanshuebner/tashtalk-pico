@@ -41,8 +41,6 @@ const DBG0_PIN: u32 = 6;
 const DBG1_PIN: u32 = 7;
 const TX_DMA_CH: usize = 1;
 const RX_DMA_CH: usize = 0;
-const DREQ_PIO0_TX0: u8 = 0;
-const DREQ_PIO1_RX0: u8 = 12;
 
 // ── RX DMA ring buffer ───────────────────────────────────────────
 const RX_RING_SIZE: usize = 4096;
@@ -210,7 +208,7 @@ fn init_rx_dma() {
     ch.trans_count().write_value(0xFFFF_FFFF);
     compiler_fence(Ordering::SeqCst);
     ch.ctrl_trig().write(|w| {
-        w.set_treq_sel(TreqSel(DREQ_PIO1_RX0));
+        w.set_treq_sel(TreqSel::PIO1_RX0);
         w.set_data_size(DataSize::SIZE_WORD);
         w.set_incr_read(false);
         w.set_incr_write(true);
@@ -316,7 +314,7 @@ fn start_tx_dma(read_addr: *const u32, word_count: usize) {
     ch.trans_count().write_value(word_count as u32);
     compiler_fence(Ordering::SeqCst);
     ch.ctrl_trig().write(|w| {
-        w.set_treq_sel(TreqSel(DREQ_PIO0_TX0));
+        w.set_treq_sel(TreqSel::PIO0_TX0);
         w.set_data_size(DataSize::SIZE_WORD);
         w.set_incr_read(true);
         w.set_incr_write(false);
