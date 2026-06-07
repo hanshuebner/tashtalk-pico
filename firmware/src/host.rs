@@ -18,6 +18,7 @@ use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::Timer;
 use embassy_usb::driver::EndpointError;
+use portable_atomic::AtomicBool;
 use tashtalk_proto::codec::{
     encode_frame, CommandParser, FrameStatus, Sink, MAX_FRAME_LEN,
 };
@@ -34,8 +35,15 @@ pub struct InboundFrame {
 /// LocalTalk → host frame queue.
 pub static INBOUND_FRAMES: Channel<ThreadModeRawMutex, InboundFrame, 8> = Channel::new();
 
+/// Whether a USB host is connected to TT_DATA.
+static HOST_CONNECTED: AtomicBool = AtomicBool::new(false);
+
 /// Queue a received LocalTalk frame for delivery up TT_DATA.
 pub fn try_forward_inbound(frame: &[u8], status: FrameStatus) {
+    if !HOST_CONNECTED.load(Ordering::Relaxed) {
+        // No host connected — silently drop, don't queue.
+        return;
+    }
     let n = frame.len().min(MAX_FRAME_LEN);
     let mut f = InboundFrame {
         buf: [0u8; MAX_FRAME_LEN],
@@ -44,7 +52,7 @@ pub fn try_forward_inbound(frame: &[u8], status: FrameStatus) {
     };
     f.buf[..n].copy_from_slice(&frame[..n]);
     if INBOUND_FRAMES.try_send(f).is_err() {
-        defmt::trace!("LT_RX: host queue full, dropped frame");
+        tt_log!("TT_DATA: dropped frame (queue full)");
     }
 }
 
@@ -67,8 +75,8 @@ pub async fn run(
             }
         }
         defmt::info!("TT_DATA: host connected");
-        // TT_DATA connection is logged via defmt only — tt_log here
-        // caused garbled output on the debug CDC during heavy traffic.
+        tt_log!("TT_DATA: connected");
+        HOST_CONNECTED.store(true, Ordering::Relaxed);
         parser.reset();
 
         loop {
@@ -99,6 +107,9 @@ pub async fn run(
                 }
             }
         }
+        HOST_CONNECTED.store(false, Ordering::Relaxed);
+        defmt::info!("TT_DATA: host disconnected");
+        tt_log!("TT_DATA: disconnected");
     }
 }
 
