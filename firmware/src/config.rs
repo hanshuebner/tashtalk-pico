@@ -5,29 +5,16 @@
 //! Each entry: [ssid_len:u8][ssid:32 bytes][pass_len:u8][pass:63 bytes] = 96 bytes
 //! Total: 8 + 4*96 + 4 = 396 bytes (fits in one 256-byte page? No — needs 2 pages)
 
-use core::cell::RefCell;
-
 use embassy_rp::flash::{Blocking, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
-use static_cell::StaticCell;
+use embassy_rp::Peri;
 
-type FlashType = Flash<'static, FLASH, Blocking, FLASH_SIZE>;
-
-static FLASH_CELL: StaticCell<RefCell<FlashType>> = StaticCell::new();
-static mut FLASH_REF: Option<&'static RefCell<FlashType>> = None;
-
-/// Store the flash handle for later use by save().
-pub fn init(flash: FlashType) {
-    let cell = FLASH_CELL.init(RefCell::new(flash));
-    unsafe { FLASH_REF = Some(cell) };
-}
-
-/// Save WiFi config using the stored flash handle.
+/// Save WiFi config, creating a temporary Flash handle.
 pub fn save_config(ssids: &[(&str, &str)]) {
-    if let Some(cell) = unsafe { FLASH_REF } {
-        let mut fl = cell.borrow_mut();
-        save(ssids, &mut fl);
-    }
+    // SAFETY: FLASH is a zero-sized peripheral marker. No concurrent users.
+    let peri: Peri<'_, FLASH> = unsafe { Peri::new_unchecked(core::mem::transmute(())) };
+    let mut fl = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(peri);
+    save(ssids, &mut fl);
 }
 
 const FLASH_SIZE: usize = 2 * 1024 * 1024;

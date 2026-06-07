@@ -144,7 +144,7 @@ async fn main(spawner: Spawner) {
     );
     info!("Core 1 spawned");
 
-    // ── Flash config ──────────────────────────────────────────────────
+    // ── Load WiFi config from flash ──────────────────────────────────
     {
         use embassy_rp::flash::{Blocking, Flash};
         let mut fl = Flash::<_, Blocking, { 2 * 1024 * 1024 }>::new_blocking(
@@ -158,7 +158,7 @@ async fn main(spawner: Spawner) {
         if n > 0 {
             info!("loaded {} WiFi network(s) from flash", n);
         }
-        config::init(fl);
+        // fl is dropped here — FLASH peripheral released.
     }
 
     // ── USB ──────────────────────────────────────────────────────────
