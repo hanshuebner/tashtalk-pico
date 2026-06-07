@@ -44,7 +44,7 @@ pub fn try_forward_inbound(frame: &[u8], status: FrameStatus) {
     };
     f.buf[..n].copy_from_slice(&frame[..n]);
     if INBOUND_FRAMES.try_send(f).is_err() {
-        tt_log!("LT_RX: host queue full, dropped frame");
+        defmt::trace!("LT_RX: host queue full, dropped frame");
     }
 }
 
