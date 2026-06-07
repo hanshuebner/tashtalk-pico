@@ -88,7 +88,6 @@ pub async fn run(
                     for &byte in &buf[..n] {
                         parser.push(byte, &mut sink);
                     }
-                    // Process any node updates or outbound frames.
                     sink.drain_outbound().await;
                 }
                 Either::First(Err(e)) => {
@@ -103,6 +102,9 @@ pub async fn run(
                             warn!("USB host write failed: {}", classify(e));
                             break;
                         }
+                    } else {
+                        // Host dropped DTR — disconnect.
+                        break;
                     }
                 }
             }
