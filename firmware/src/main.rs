@@ -144,12 +144,16 @@ async fn main(spawner: Spawner) {
     );
     info!("Core 1 spawned");
 
-    // ── Load WiFi config from flash ──────────────────────────────────
+    // ── USB ──────────────────────────────────────────────────────────
+    let driver = Driver::new(p.USB, Irqs);
+    let (usb_run, data_cdc, debug_cdc) = usb_dev::build(driver, p.FLASH);
+
+    // ── Load WiFi config from flash (after USB init) ────────────────
     {
         use embassy_rp::flash::{Blocking, Flash};
-        let mut fl = Flash::<_, Blocking, { 2 * 1024 * 1024 }>::new_blocking(
-            unsafe { p.FLASH.clone_unchecked() }
-        );
+        let peri: embassy_rp::Peri<'_, embassy_rp::peripherals::FLASH> =
+            unsafe { embassy_rp::Peri::new_unchecked(core::mem::transmute(())) };
+        let mut fl = Flash::<_, Blocking, { 2 * 1024 * 1024 }>::new_blocking(peri);
         let mut n = 0u32;
         config::load(&mut fl, |ssid, pass| {
             wifi::add_network(ssid, pass);
@@ -158,12 +162,7 @@ async fn main(spawner: Spawner) {
         if n > 0 {
             info!("loaded {} WiFi network(s) from flash", n);
         }
-        // fl is dropped here — FLASH peripheral released.
     }
-
-    // ── USB ──────────────────────────────────────────────────────────
-    let driver = Driver::new(p.USB, Irqs);
-    let (usb_run, data_cdc, debug_cdc) = usb_dev::build(driver, p.FLASH);
 
     // ── Spawn non-WiFi tasks ────────────────────────────────────────
     spawner.spawn(usb_run_task(usb_run).unwrap());
