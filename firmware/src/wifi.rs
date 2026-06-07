@@ -147,15 +147,33 @@ pub fn remove_network(ssid: &str) -> bool {
     unsafe { WIFI_CONFIGS.remove(ssid) }
 }
 
+// ── Flash handle for config saves ──────────────────────────────────
+
+type FlashType = embassy_rp::flash::Flash<
+    'static,
+    embassy_rp::peripherals::FLASH,
+    embassy_rp::flash::Blocking,
+    { 2 * 1024 * 1024 },
+>;
+
+static mut FLASH_REF: Option<&'static core::cell::RefCell<FlashType>> = None;
+
+pub fn set_flash(flash: &'static core::cell::RefCell<FlashType>) {
+    unsafe { FLASH_REF = Some(flash) };
+}
+
 /// Save current config to flash.
 pub fn save_config() {
+    let flash_ref = unsafe { FLASH_REF };
+    let Some(cell) = flash_ref else { return };
+    let mut fl = cell.borrow_mut();
     let count = unsafe { WIFI_CONFIGS.count };
     let mut pairs: heapless::Vec<(&str, &str), 4> = heapless::Vec::new();
     for i in 0..count {
         let e = unsafe { &WIFI_CONFIGS.entries[i] };
         let _ = pairs.push((e.ssid.as_str(), e.pass.as_str()));
     }
-    crate::config::save_config(&pairs);
+    crate::config::save(&pairs, &mut fl);
 }
 
 /// Number of configured networks.
@@ -216,54 +234,64 @@ async fn net_task(mut runner: NetRunner) -> ! {
 
 #[embassy_executor::task]
 async fn wifi_task(mut control: cyw43::Control<'static>) -> ! {
-    // Wait for CYW43 to be fully ready before starting WiFi operations.
-    embassy_time::Timer::after_secs(10).await;
+    // Give CYW43 firmware time to settle after init before first scan.
+    embassy_time::Timer::after_secs(3).await;
 
     loop {
-        let count = unsafe { WIFI_CONFIGS.count };
-        if count == 0 {
+        if unsafe { WIFI_CONFIGS.count } == 0 {
             embassy_time::Timer::after_secs(5).await;
             continue;
         }
 
-        // Try each configured network in order.
-        let mut connected = false;
-        for i in 0..count {
-            let ssid = unsafe { WIFI_CONFIGS.entries[i].ssid.as_str() };
-            let pass = unsafe { WIFI_CONFIGS.entries[i].pass.as_str() };
+        // Scan for networks and pick the strongest known SSID.
+        // The scan also serves as a warmup for the CYW43 firmware —
+        // joining without a prior scan crashes the system.
+        WIFI_STATE.store(STATE_SCANNING, Ordering::Relaxed);
+        let mut best_ssid: heapless::String<MAX_SSID_LEN> = heapless::String::new();
+        let mut best_rssi: i16 = i16::MIN;
 
-            WIFI_STATE.store(STATE_JOINING, Ordering::Relaxed);
-            info!("WiFi: joining '{}'", ssid);
-            let opts = JoinOptions::new(pass.as_bytes());
-            match control.join(ssid, opts).await {
-                Ok(()) => {
-                    WIFI_STATE.store(STATE_CONNECTED, Ordering::Relaxed);
-                    unsafe {
-                        CONNECTED_SSID.clear();
-                        let _ = CONNECTED_SSID.push_str(ssid);
+        {
+            let mut scanner = control.scan(Default::default()).await;
+            while let Some(bss) = scanner.next().await {
+                let ssid_len = (bss.ssid_len as usize).min(32);
+                if let Ok(ssid) = core::str::from_utf8(&bss.ssid[..ssid_len]) {
+                    if unsafe { WIFI_CONFIGS.find(ssid).is_some() } && bss.rssi > best_rssi {
+                        best_rssi = bss.rssi;
+                        best_ssid.clear();
+                        let _ = best_ssid.push_str(ssid);
                     }
-                    info!("WiFi: connected to '{}'", ssid);
-                    connected = true;
-                    break;
-                }
-                Err(_e) => {
-                    info!("WiFi: join '{}' failed", ssid);
                 }
             }
         }
 
-        if connected {
-            // Wait until link drops, then reconnect.
-            if let Some(stack) = crate::wifi::stack() {
-                stack.wait_link_down().await;
-            }
-            WIFI_STATE.store(STATE_DISCONNECTED, Ordering::Relaxed);
-            unsafe { CONNECTED_SSID.clear(); }
-            info!("WiFi: link lost, reconnecting");
-            embassy_time::Timer::after_secs(2).await;
-        } else {
+        if best_ssid.is_empty() {
             WIFI_STATE.store(STATE_DISCONNECTED, Ordering::Relaxed);
             embassy_time::Timer::after_secs(10).await;
+            continue;
+        }
+
+        // Join the best network.
+        let pass = unsafe { WIFI_CONFIGS.passphrase_for(best_ssid.as_str()) }
+            .unwrap_or("");
+        WIFI_STATE.store(STATE_JOINING, Ordering::Relaxed);
+        info!("WiFi: joining '{}'", best_ssid.as_str());
+        let opts = JoinOptions::new(pass.as_bytes());
+        match control.join(best_ssid.as_str(), opts).await {
+            Ok(()) => {
+                WIFI_STATE.store(STATE_CONNECTED, Ordering::Relaxed);
+                unsafe {
+                    CONNECTED_SSID.clear();
+                    let _ = CONNECTED_SSID.push_str(best_ssid.as_str());
+                }
+                info!("WiFi: connected to '{}'", best_ssid.as_str());
+                loop {
+                    embassy_time::Timer::after_secs(30).await;
+                }
+            }
+            Err(_e) => {
+                WIFI_STATE.store(STATE_DISCONNECTED, Ordering::Relaxed);
+                embassy_time::Timer::after_secs(5).await;
+            }
         }
     }
 }

@@ -144,18 +144,10 @@ async fn main(spawner: Spawner) {
     );
     info!("Core 1 spawned");
 
-    // ── USB ──────────────────────────────────────────────────────────
-    let driver = Driver::new(p.USB, Irqs);
-    let (usb_run, data_cdc, debug_cdc) = usb_dev::build(driver, p.FLASH);
-
-    // ── Load WiFi config from flash (after USB init) ────────────────
+    // ── Load WiFi config from flash (XIP read, no FLASH handle needed) ──
     {
-        use embassy_rp::flash::{Blocking, Flash};
-        let peri: embassy_rp::Peri<'_, embassy_rp::peripherals::FLASH> =
-            unsafe { embassy_rp::Peri::new_unchecked(core::mem::transmute(())) };
-        let mut fl = Flash::<_, Blocking, { 2 * 1024 * 1024 }>::new_blocking(peri);
         let mut n = 0u32;
-        config::load(&mut fl, |ssid, pass| {
+        config::load(|ssid, pass| {
             wifi::add_network(ssid, pass);
             n += 1;
         });
@@ -163,6 +155,20 @@ async fn main(spawner: Spawner) {
             info!("loaded {} WiFi network(s) from flash", n);
         }
     }
+
+    // ── USB + Flash ──────────────────────────────────────────────────
+    // Read USB serial from flash, then keep the Flash handle for config saves.
+    let driver = Driver::new(p.USB, Irqs);
+    static FLASH_CELL: StaticCell<
+        core::cell::RefCell<embassy_rp::flash::Flash<'static, embassy_rp::peripherals::FLASH, embassy_rp::flash::Blocking, { 2 * 1024 * 1024 }>>
+    > = StaticCell::new();
+    let (usb_run, data_cdc, debug_cdc) = {
+        let mut fl = embassy_rp::flash::Flash::<_, embassy_rp::flash::Blocking, { 2 * 1024 * 1024 }>::new_blocking(p.FLASH);
+        let serial = usb_dev::read_serial(&mut fl);
+        let flash_ref = FLASH_CELL.init(core::cell::RefCell::new(fl));
+        wifi::set_flash(flash_ref);
+        usb_dev::build_with_serial(driver, serial)
+    };
 
     // ── Spawn non-WiFi tasks ────────────────────────────────────────
     spawner.spawn(usb_run_task(usb_run).unwrap());

@@ -1,25 +1,16 @@
 //! Flash-backed configuration storage.
 //!
 //! Stores WiFi credentials in the last 4KB sector of flash (offset 0x1FF000).
-//! Format: [magic:u32][version:u8][count:u8][padding:u16][entries...][crc:u32]
-//! Each entry: [ssid_len:u8][ssid:32 bytes][pass_len:u8][pass:63 bytes] = 96 bytes
-//! Total: 8 + 4*96 + 4 = 396 bytes (fits in one 256-byte page? No — needs 2 pages)
+//! Reads via XIP (memory-mapped flash). Writes via embassy-rp Flash HAL.
 
 use embassy_rp::flash::{Blocking, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
-use embassy_rp::Peri;
-
-/// Save WiFi config, creating a temporary Flash handle.
-pub fn save_config(ssids: &[(&str, &str)]) {
-    // SAFETY: FLASH is a zero-sized peripheral marker. No concurrent users.
-    let peri: Peri<'_, FLASH> = unsafe { Peri::new_unchecked(core::mem::transmute(())) };
-    let mut fl = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(peri);
-    save(ssids, &mut fl);
-}
 
 const FLASH_SIZE: usize = 2 * 1024 * 1024;
 /// Config lives in the last 4KB sector.
 const CONFIG_OFFSET: u32 = (FLASH_SIZE - ERASE_SIZE) as u32;
+/// XIP base address for reading flash as memory.
+const XIP_BASE: usize = 0x10000000;
 const MAGIC: u32 = 0x5441_5348; // "TASH"
 const VERSION: u8 = 1;
 
@@ -33,6 +24,8 @@ const ENTRY_SIZE: usize = 100;
 const HEADER_SIZE: usize = 8;
 /// Total: header + entries + crc
 const CONFIG_SIZE: usize = HEADER_SIZE + MAX_ENTRIES * ENTRY_SIZE + 4;
+/// Buffer rounded up to flash page size (256 bytes).
+const BUF_SIZE: usize = (CONFIG_SIZE + 255) & !255;
 
 fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
@@ -49,15 +42,16 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Read WiFi config from flash. Calls `callback` for each (ssid, pass) pair.
-pub fn load(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, mut callback: impl FnMut(&str, &str)) {
+/// Read WiFi config from flash via XIP. No Flash handle needed.
+pub fn load(mut callback: impl FnMut(&str, &str)) {
+    // Read directly from memory-mapped flash.
+    let ptr = (XIP_BASE + CONFIG_OFFSET as usize) as *const u8;
+    let flash_data = unsafe { core::slice::from_raw_parts(ptr, CONFIG_SIZE) };
+
+    // Copy to a stack buffer to avoid alignment issues.
     let mut buf = [0u8; CONFIG_SIZE];
+    buf.copy_from_slice(flash_data);
 
-    if flash.blocking_read(CONFIG_OFFSET, &mut buf).is_err() {
-        return;
-    }
-
-    // Check magic.
     let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     if magic != MAGIC {
         return;
@@ -70,7 +64,6 @@ pub fn load(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, mut callback: im
         return;
     }
 
-    // Verify CRC over header + entries.
     let data_len = HEADER_SIZE + MAX_ENTRIES * ENTRY_SIZE;
     let stored_crc = u32::from_le_bytes([
         buf[data_len],
@@ -82,7 +75,6 @@ pub fn load(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, mut callback: im
         return;
     }
 
-    // Parse entries.
     for i in 0..count {
         let base = HEADER_SIZE + i * ENTRY_SIZE;
         let ssid_len = (buf[base] as usize).min(MAX_SSID);
@@ -96,33 +88,29 @@ pub fn load(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, mut callback: im
     }
 }
 
-/// Save WiFi config to flash. Erases the config sector and writes.
-/// The flash erase (~100ms) briefly pauses XIP; USB may see a glitch.
+/// Save WiFi config to flash using a Flash handle.
 pub fn save(ssids: &[(&str, &str)], flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>) {
     let count = ssids.len().min(MAX_ENTRIES);
 
-    // Buffer rounded up to page boundary (256 bytes).
-    const BUF_SIZE: usize = (CONFIG_SIZE + 255) & !255;
     let mut buf = [0xFFu8; BUF_SIZE];
 
     // Header.
     buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     buf[4] = VERSION;
     buf[5] = count as u8;
-    buf[6] = 0; // padding
-    buf[7] = 0;
 
     // Entries.
     for (i, (ssid, pass)) in ssids.iter().take(MAX_ENTRIES).enumerate() {
         let base = HEADER_SIZE + i * ENTRY_SIZE;
         let ssid_bytes = ssid.as_bytes();
         let pass_bytes = pass.as_bytes();
-        buf[base] = ssid_bytes.len().min(MAX_SSID) as u8;
-        buf[base + 1..base + 1 + ssid_bytes.len().min(MAX_SSID)]
-            .copy_from_slice(&ssid_bytes[..ssid_bytes.len().min(MAX_SSID)]);
-        buf[base + 1 + MAX_SSID] = pass_bytes.len().min(MAX_PASS) as u8;
-        buf[base + 1 + MAX_SSID + 1..base + 1 + MAX_SSID + 1 + pass_bytes.len().min(MAX_PASS)]
-            .copy_from_slice(&pass_bytes[..pass_bytes.len().min(MAX_PASS)]);
+        let slen = ssid_bytes.len().min(MAX_SSID);
+        let plen = pass_bytes.len().min(MAX_PASS);
+        buf[base] = slen as u8;
+        buf[base + 1..base + 1 + slen].copy_from_slice(&ssid_bytes[..slen]);
+        buf[base + 1 + MAX_SSID] = plen as u8;
+        buf[base + 1 + MAX_SSID + 1..base + 1 + MAX_SSID + 1 + plen]
+            .copy_from_slice(&pass_bytes[..plen]);
     }
 
     // CRC over header + entries.
@@ -130,6 +118,11 @@ pub fn save(ssids: &[(&str, &str)], flash: &mut Flash<'_, FLASH, Blocking, FLASH
     let crc = crc32(&buf[..data_len]);
     buf[data_len..data_len + 4].copy_from_slice(&crc.to_le_bytes());
 
-    let _ = flash.blocking_erase(CONFIG_OFFSET, CONFIG_OFFSET + ERASE_SIZE as u32);
-    let _ = flash.blocking_write(CONFIG_OFFSET, &buf);
+    if let Err(_e) = flash.blocking_erase(CONFIG_OFFSET, CONFIG_OFFSET + ERASE_SIZE as u32) {
+        defmt::warn!("config: flash erase failed");
+        return;
+    }
+    if let Err(_e) = flash.blocking_write(CONFIG_OFFSET, &buf) {
+        defmt::warn!("config: flash write failed");
+    }
 }
