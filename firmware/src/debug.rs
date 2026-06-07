@@ -1,4 +1,4 @@
-//! Debug CDC task — TT_DEBUG.
+//! Debug CDC task — debug shell.
 //!
 //! Drains the `tt_log` channel and emits each message to the host, and runs
 //! a line-oriented command interpreter.
@@ -209,7 +209,7 @@ pub async fn run(mut cdc: Cdc, shared: &'static SharedState) -> ! {
                 break;
             }
         }
-        info!("TT_DEBUG: host connected");
+        info!("debug shell: host connected");
         unsafe { LINE_LEN = 0 };
 
         let _ = write_banner(&mut cdc).await;
@@ -220,7 +220,7 @@ pub async fn run(mut cdc: Cdc, shared: &'static SharedState) -> ! {
             // never written while input/command processing is in flight.
             if let Ok(line) = LOG_CHANNEL.try_receive() {
                 if let Err(e) = wline(&mut cdc, line.as_bytes()).await {
-                    warn!("TT_DEBUG log write failed: {}", classify(e));
+                    warn!("debug shell log write failed: {}", classify(e));
                     break;
                 }
                 continue; // drain all pending before blocking for input
@@ -231,23 +231,23 @@ pub async fn run(mut cdc: Cdc, shared: &'static SharedState) -> ! {
                     // Process ALL bytes in this packet before delivering
                     // any log lines — feed_bytes may echo + dispatch.
                     if let Err(e) = feed_bytes(&mut cdc, &buf[..n], shared).await {
-                        warn!("TT_DEBUG write failed: {}", classify(e));
+                        warn!("debug shell write failed: {}", classify(e));
                         break;
                     }
                 }
                 Either::First(Err(e)) => {
-                    warn!("TT_DEBUG read failed: {}", classify(e));
+                    warn!("debug shell read failed: {}", classify(e));
                     break;
                 }
                 Either::Second(line) => {
                     if let Err(e) = wline(&mut cdc, line.as_bytes()).await {
-                        warn!("TT_DEBUG log write failed: {}", classify(e));
+                        warn!("debug shell log write failed: {}", classify(e));
                         break;
                     }
                 }
             }
         }
-        info!("TT_DEBUG: host disconnected");
+        info!("debug shell: host disconnected");
     }
 }
 

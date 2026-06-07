@@ -1,4 +1,4 @@
-//! Data CDC task — TT_DATA.
+//! Data CDC task — USB host.
 //!
 //! Wires the host byte stream into `tashtalk-proto`'s `CommandParser`
 //! (host → LocalTalk) and forwards every LocalTalk frame heard on the
@@ -35,10 +35,10 @@ pub struct InboundFrame {
 /// LocalTalk → host frame queue.
 pub static INBOUND_FRAMES: Channel<ThreadModeRawMutex, InboundFrame, 8> = Channel::new();
 
-/// Whether a USB host is connected to TT_DATA.
+/// Whether a USB host is connected to USB host.
 static HOST_CONNECTED: AtomicBool = AtomicBool::new(false);
 
-/// Queue a received LocalTalk frame for delivery up TT_DATA.
+/// Queue a received LocalTalk frame for delivery up USB host.
 pub fn try_forward_inbound(frame: &[u8], status: FrameStatus) {
     if !HOST_CONNECTED.load(Ordering::Relaxed) {
         // No host connected — silently drop, don't queue.
@@ -52,7 +52,7 @@ pub fn try_forward_inbound(frame: &[u8], status: FrameStatus) {
     };
     f.buf[..n].copy_from_slice(&frame[..n]);
     if INBOUND_FRAMES.try_send(f).is_err() {
-        tt_log!("TT_DATA: dropped frame (queue full)");
+        tt_log!("USB host: dropped frame (queue full)");
     }
 }
 
@@ -74,8 +74,8 @@ pub async fn run(
                 break;
             }
         }
-        defmt::info!("TT_DATA: host connected");
-        tt_log!("TT_DATA: connected");
+        defmt::info!("USB host: host connected");
+        tt_log!("USB host: connected");
         HOST_CONNECTED.store(true, Ordering::Relaxed);
         parser.reset();
 
@@ -92,7 +92,7 @@ pub async fn run(
                     sink.drain_outbound().await;
                 }
                 Either::First(Err(e)) => {
-                    warn!("TT_DATA read failed: {}", classify(e));
+                    warn!("USB host read failed: {}", classify(e));
                     break;
                 }
                 Either::Second(inbound) => {
@@ -100,7 +100,7 @@ pub async fn run(
                         let encoded =
                             encode_frame(&inbound.buf[..inbound.len as usize], inbound.status);
                         if let Err(e) = write_chunked(&mut cdc, &encoded).await {
-                            warn!("TT_DATA write failed: {}", classify(e));
+                            warn!("USB host write failed: {}", classify(e));
                             break;
                         }
                     }
@@ -108,8 +108,8 @@ pub async fn run(
             }
         }
         HOST_CONNECTED.store(false, Ordering::Relaxed);
-        defmt::info!("TT_DATA: host disconnected");
-        tt_log!("TT_DATA: disconnected");
+        defmt::info!("USB host: host disconnected");
+        tt_log!("USB host: disconnected");
     }
 }
 
