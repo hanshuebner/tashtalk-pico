@@ -21,7 +21,7 @@ use tashtalk_proto::nodemap::NodeBitmap;
 pub static MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// When true, protocol analyzer mode: all frames (including bad CRC)
-/// are forwarded to rx_slot and printed on the debug port.
+/// are forwarded to the RX slot ring and printed on the debug port.
 pub static ANALYZER_MODE: AtomicBool = AtomicBool::new(false);
 
 const RX_LOG_SLOTS: usize = 16;
@@ -521,11 +521,11 @@ async fn write_log_line(cdc: &mut Cdc, line: &LogLine) -> Result<(), EndpointErr
     Ok(())
 }
 
-fn pio_status(shared: &SharedState) -> heapless::String<768> {
+fn pio_status(shared: &SharedState) -> heapless::String<1024> {
     use core::fmt::Write;
     use embassy_rp::pac;
 
-    let mut s = heapless::String::<768>::new();
+    let mut s = heapless::String::<1024>::new();
     let ms = embassy_time::Instant::now().as_millis();
     let _ = write!(s, "[{:06}] status\r\n", ms);
 
@@ -544,8 +544,10 @@ fn pio_status(shared: &SharedState) -> heapless::String<768> {
     let _ = write!(s, "GP4: funcsel={} ie={} od={} pue={} pde={}\r\n",
         gp4_ctrl.funcsel() as u8, gp4_pad.ie() as u8, gp4_pad.od() as u8,
         gp4_pad.pue() as u8, gp4_pad.pde() as u8);
-    let _ = write!(s, "Flags: 0x{:02x} alive={} rxrdy={} txsub={}\r\n",
-        flags, (flags >> 5) & 1, (flags >> 3) & 1, flags & 1);
+    let rx_queued = shared.rx_head.load(Ordering::Relaxed)
+        .wrapping_sub(shared.rx_tail.load(Ordering::Relaxed));
+    let _ = write!(s, "Flags: 0x{:02x} alive={} rxq={} txsub={}\r\n",
+        flags, (flags >> 5) & 1, rx_queued, flags & 1);
     let loop_count = unsafe { crate::core1::LOOP_COUNT };
     let _ = write!(s, "DMA: en={} widx={} ridx={} remain={}\r\n", en, widx, ridx, remain);
     let _ = write!(s, "Core1: loops={}\r\n", loop_count);
@@ -560,11 +562,18 @@ fn pio_status(shared: &SharedState) -> heapless::String<768> {
     let dir_rx = unsafe { crate::core1::DIRECTED_RX_COUNT };
     let echo_skip = unsafe { crate::core1::ECHO_SKIP_COUNT };
     let bad_real = unsafe { crate::core1::BAD_REAL_COUNT };
+    let rx_drop = unsafe { crate::core1::RX_DROP_COUNT };
+    let ar_late = unsafe { crate::core1::AUTOREPLY_LATE };
+    let ar_wait = unsafe { crate::core1::AUTOREPLY_WAIT_MAX_US };
+    let bus_tmo = unsafe { crate::core1::BUS_IDLE_TIMEOUTS };
 
-    let _ = write!(s, "Recv: good={} bad={} bad_real={} ar={} echo={} overrun={}\r\n",
-        good, bad, bad_real, ar, echo_skip, overruns);
-    let _ = write!(s, "Send: dir_att={} cts_ok={} tmo={} dir_rx={}\r\n",
-        dir_att, dir_cts, dir_tmo, dir_rx);
+    let _ = write!(s, "Recv: good={} bad={} bad_real={} ar={} echo={} overrun={} drop={}\r\n",
+        good, bad, bad_real, ar, echo_skip, overruns, rx_drop);
+    // Auto-replies wait for the sender's abort sequence to finish first.
+    // `late` counts the ones where the line didn't go quiet within 200µs.
+    let _ = write!(s, "Reply: late={} wait_max={}us\r\n", ar_late, ar_wait);
+    let _ = write!(s, "Send: dir_att={} cts_ok={} tmo={} dir_rx={} bus_idle_tmo={}\r\n",
+        dir_att, dir_cts, dir_tmo, dir_rx, bus_tmo);
 
     let cts_start = unsafe { crate::core1::LAST_CTS_WAIT_START };
     let cts_end = unsafe { crate::core1::LAST_CTS_WAIT_END };

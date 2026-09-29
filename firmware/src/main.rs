@@ -16,8 +16,6 @@
 #![no_main]
 #![allow(static_mut_refs)] // embassy multicore API requires &mut Stack
 
-use core::sync::atomic::{compiler_fence, Ordering};
-
 use defmt::info;
 use embassy_executor::Executor;
 use embassy_rp::bind_interrupts;
@@ -144,15 +142,11 @@ async fn usb_run_task(mut usb: usb_dev::UsbDevice) {
     usb.run().await;
 }
 
-/// Bridge: polls core 1's rx_slot and forwards frames to the host task.
+/// Bridge: drains core 1's RX slot ring and forwards frames to the host task.
 #[embassy_executor::task]
 async fn rx_bridge_task(shared: &'static core1::SharedState) {
     loop {
-        let flags = shared.flags.load(Ordering::Relaxed);
-        if flags & core1::RX_READY != 0 {
-            compiler_fence(Ordering::SeqCst);
-            // SAFETY: RX_READY set → core 1 is not writing.
-            let slot = unsafe { &*shared.rx_slot.get() };
+        let got = shared.with_rx(|slot| {
             let len = slot.len as usize;
             let status = match slot.status {
                 1 => FrameStatus::BadCrc,
@@ -161,8 +155,8 @@ async fn rx_bridge_task(shared: &'static core1::SharedState) {
             host::try_forward_inbound(&slot.buf[..len], status);
             let crc_ok = matches!(status, FrameStatus::Good);
             debug::log_rx_frame(&slot.buf[..len], crc_ok);
-            shared.flags.fetch_and(!core1::RX_READY, Ordering::Release);
-        } else {
+        });
+        if got.is_none() {
             Timer::after_micros(50).await;
         }
     }
