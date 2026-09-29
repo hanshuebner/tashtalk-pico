@@ -9,7 +9,8 @@
 //! signaled by a 0xFFFFFFFF marker word. Core 1 feeds decoded bits
 //! through BitUnstuffer → FrameAssembler in a tight poll loop.
 //!
-//! Communication with core 0 is via shared memory with atomic flag bits.
+//! Communication with core 0 is via shared memory, with atomic flag bits
+//! for TX and the node bitmap and a small ring for received frames.
 
 #![allow(dead_code)]
 
@@ -31,7 +32,8 @@ use tashtalk_proto::nodemap::NodeBitmap;
 pub const TX_SUBMIT: u32     = 1 << 0;
 pub const TX_DONE: u32       = 1 << 1;
 pub const TX_RESULT_FAIL: u32 = 1 << 2;
-pub const RX_READY: u32      = 1 << 3;
+// Bit 3 used to be RX_READY, the handshake for the old single RX slot.
+// Received frames go through the rx_slots ring now.
 pub const NODES_UPDATED: u32 = 1 << 4;
 pub const CORE1_ALIVE: u32   = 1 << 5;
 
@@ -66,6 +68,15 @@ pub static mut BAD_REAL_COUNT: u32 = 0;
 pub static mut LOOP_COUNT: u32 = 0;
 pub static mut RING_OVERRUN_COUNT: u32 = 0;
 pub static mut DIRECTED_TX_ATTEMPTS: u32 = 0;
+/// Frames we dropped because core 0 hadn't emptied the RX slot ring yet.
+pub static mut RX_DROP_COUNT: u32 = 0;
+/// Auto-replies we dropped because the line didn't go quiet in time.
+pub static mut AUTOREPLY_LATE: u32 = 0;
+/// The longest we've waited between a closing flag and the line going
+/// quiet before sending a reply.
+pub static mut AUTOREPLY_WAIT_MAX_US: u32 = 0;
+/// How many times wait_bus_idle gave up on a carrier that never dropped.
+pub static mut BUS_IDLE_TIMEOUTS: u32 = 0;
 
 /// Zero all debug counters. Called from core 0's debug shell.
 pub fn clear_counters() {
@@ -84,6 +95,10 @@ pub fn clear_counters() {
         DIRECTED_TX_TIMEOUT = 0;
         DIRECTED_RX_COUNT = 0;
         ECHO_SKIP_COUNT = 0;
+        RX_DROP_COUNT = 0;
+        AUTOREPLY_LATE = 0;
+        AUTOREPLY_WAIT_MAX_US = 0;
+        BUS_IDLE_TIMEOUTS = 0;
     }
 }
 pub static mut DIRECTED_TX_CTS_OK: u32 = 0;
@@ -115,6 +130,35 @@ static mut LAST_ACTIVITY_US: u64 = 0;
 /// One bit cell is ~4.34µs; a full flag byte is ~35µs. 50µs of silence
 /// means at least one full byte time with no transitions.
 const CARRIER_IDLE_US: u64 = 50;
+
+/// How long after a frame's closing flag we can still send its auto-reply.
+///
+/// The sender keeps driving the line for its abort sequence (12-18 one bits,
+/// up to ~78µs) after the closing flag, so we hold the reply until the line
+/// goes quiet. Inside AppleTalk gives the responder 200µs. If the line is
+/// still busy after that it's probably someone else's frame, and the sender
+/// will retry anyway.
+const REPLY_WINDOW_US: u64 = 200;
+
+/// How long to wait for a peer's CTS to start arriving after our RTS.
+///
+/// Inside AppleTalk gives the responder 200µs to answer an RTS. We only see
+/// a word once 8 bits of it have been decoded, so the extra margin covers
+/// that latency on our side and the peer's decode latency on theirs. Once we
+/// see any activity the deadline gets extended so the whole frame has time
+/// to arrive.
+const CTS_START_WINDOW_US: u64 = 400;
+
+/// The longest wait_bus_idle will wait for the carrier to drop before giving
+/// up. Without this a transceiver fault or a jabbering node could keep core 1
+/// stuck in that loop forever, so we let the backoff deal with it instead.
+const MAX_BUS_IDLE_WAIT_US: u64 = 500_000;
+
+/// How many received frames core 1 can hold for core 0. We forward every good
+/// frame, RTS and CTS included, and a dialog's data frame follows its RTS
+/// within 200µs. With a single slot that data frame gets dropped if core 0
+/// hasn't collected the RTS yet.
+pub const RX_SLOT_COUNT: usize = 4;
 
 // ── Shared state ───────────────────────────────────────────────────
 
@@ -161,8 +205,11 @@ pub struct SharedState {
     // Core 0 writes, core 1 reads (synchronized by NODES_UPDATED)
     pub node_bitmap: UnsafeCell<[u8; 32]>,
 
-    // Core 1 writes, core 0 reads (synchronized by RX_READY)
-    pub rx_slot: UnsafeCell<RxSlot>,
+    // Core 1 writes, core 0 reads. It's a ring indexed by free-running
+    // counters: core 1 moves rx_head along and core 0 moves rx_tail.
+    pub rx_slots: [UnsafeCell<RxSlot>; RX_SLOT_COUNT],
+    pub rx_head: AtomicU32,
+    pub rx_tail: AtomicU32,
 
     // Both cores (atomic)
     pub flags: AtomicU32,
@@ -185,14 +232,64 @@ impl SharedState {
                 is_directed: false,
             }),
             node_bitmap: UnsafeCell::new([0u8; 32]),
-            rx_slot: UnsafeCell::new(RxSlot {
-                buf: [0u8; MAX_FRAME_LEN],
-                len: 0,
-                status: 0,
-            }),
+            rx_slots: [
+                UnsafeCell::new(RxSlot::empty()),
+                UnsafeCell::new(RxSlot::empty()),
+                UnsafeCell::new(RxSlot::empty()),
+                UnsafeCell::new(RxSlot::empty()),
+            ],
+            rx_head: AtomicU32::new(0),
+            rx_tail: AtomicU32::new(0),
             flags: AtomicU32::new(0),
         }
     }
+
+    /// Core 0 side: pass the oldest received frame to `f`, then free up its
+    /// slot. Returns `None` if nothing is waiting.
+    pub fn with_rx<R>(&self, f: impl FnOnce(&RxSlot) -> R) -> Option<R> {
+        let tail = self.rx_tail.load(Ordering::Relaxed);
+        let head = self.rx_head.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: tail != head means core 1 published this slot and will
+        // not rewrite it until rx_tail advances past it.
+        let slot = unsafe { &*self.rx_slots[tail as usize % RX_SLOT_COUNT].get() };
+        let r = f(slot);
+        compiler_fence(Ordering::SeqCst);
+        self.rx_tail.store(tail.wrapping_add(1), Ordering::Release);
+        Some(r)
+    }
+}
+
+impl RxSlot {
+    pub const fn empty() -> Self {
+        Self {
+            buf: [0u8; MAX_FRAME_LEN],
+            len: 0,
+            status: 0,
+        }
+    }
+}
+
+/// Core 1 side: push a received frame into the RX ring, dropping when full.
+fn push_rx(shared: &SharedState, frame: &[u8], crc_ok: bool) {
+    let head = shared.rx_head.load(Ordering::Relaxed);
+    let tail = shared.rx_tail.load(Ordering::Acquire);
+    if head.wrapping_sub(tail) >= RX_SLOT_COUNT as u32 {
+        unsafe { RX_DROP_COUNT += 1; }
+        return;
+    }
+    let n = frame.len().min(MAX_FRAME_LEN);
+    // SAFETY: the slot at head is not visible to core 0 until rx_head is
+    // advanced below.
+    let slot = unsafe { &mut *shared.rx_slots[head as usize % RX_SLOT_COUNT].get() };
+    slot.buf[..n].copy_from_slice(&frame[..n]);
+    slot.len = n as u16;
+    slot.status = if crc_ok { 0 } else { 1 };
+    compiler_fence(Ordering::SeqCst);
+    shared.rx_head.store(head.wrapping_add(1), Ordering::Release);
 }
 
 // ── RX via DMA ring buffer ────────────────────────────────────────
@@ -458,16 +555,6 @@ fn build_small_frame_dma(frame: &[u8; 5]) -> (usize, usize) {
     (word_count, fm0_count)
 }
 
-/// Build and transmit a small control frame (auto-reply).
-fn transmit_small_frame(frame: &[u8; 5]) {
-    let (word_count, fm0_len) = build_small_frame_dma(frame);
-    transmit_dma(
-        unsafe { AUTOREPLY_DMA_BUF.as_ptr() },
-        word_count,
-        fm0_len,
-    );
-}
-
 // ── Debug GPIO ────────────────────────────────────────────────────
 
 fn init_debug_gpio() {
@@ -520,123 +607,222 @@ fn busy_wait_us(us: u64) {
 
 // ── Frame completion (shared by main loop and CTS wait) ──────────
 
-/// Process a completed frame: stats, echo suppression, auto-reply, host forwarding.
-/// Called when FrameEnd is detected (either from HDLC flag or frame-end marker).
-fn handle_frame_end(
-    assembler: &FrameAssembler,
-    nodes: &NodeBitmap,
-    shared: &SharedState,
-    frames_seen: &mut u32,
-) {
-    *frames_seen = frames_seen.wrapping_add(1);
-    let frame = assembler.current();
-    let crc_ok = frame_crc_ok(frame);
+// ── Receive engine ────────────────────────────────────────────────
 
-    let analyzer = crate::debug::ANALYZER_MODE.load(Ordering::Relaxed);
+/// An auto-reply that's been encoded into AUTOREPLY_DMA_BUF and is waiting
+/// for the line to go quiet.
+struct PendingReply {
+    word_count: usize,
+    fm0_len: usize,
+    /// When we decoded the closing flag of the frame this is answering.
+    since: u64,
+}
 
-    // Echo suppression: skip frames where src is one of our nodes.
-    // In analyzer mode, show everything including echoes.
-    let is_echo = frame.len() >= 2 && nodes.contains(frame[1]);
-    if is_echo && !analyzer {
-        unsafe { ECHO_SKIP_COUNT += 1; }
-        return;
-    }
+/// Decodes the RX ring into frames and answers ENQs and RTSes. The main loop
+/// owns it and hands it to the CSMA waits as well, so we keep decoding and
+/// answering frames even while we're waiting to transmit.
+struct RxEngine {
+    unstuffer: BitUnstuffer,
+    assembler: FrameAssembler,
+    nodes: NodeBitmap,
+    frames_seen: u32,
+    pending: Option<PendingReply>,
+}
 
-    // Count directed frames (Mac → us).
-    if frame.len() >= 1 && nodes.contains(frame[0]) {
-        unsafe { DIRECTED_RX_COUNT += 1; }
-    }
-
-    if crc_ok {
-        unsafe {
-            GOOD_CRC_COUNT += 1;
-            LAST_GOOD_LEN = frame.len() as u16;
-            let n = frame.len().min(8);
-            LAST_GOOD_FRAME = [0u8; 8];
-            LAST_GOOD_FRAME[..n].copy_from_slice(&frame[..n]);
-        }
-    } else {
-        unsafe {
-            BAD_CRC_COUNT += 1;
-            if frame.len() > 5 { BAD_REAL_COUNT += 1; }
-            LAST_BAD_LEN = frame.len() as u16;
-            let n = frame.len().min(8);
-            LAST_BAD_FRAME = [0u8; 8];
-            LAST_BAD_FRAME[..n].copy_from_slice(&frame[..n]);
+impl RxEngine {
+    fn new() -> Self {
+        Self {
+            unstuffer: BitUnstuffer::new(),
+            assembler: FrameAssembler::new(),
+            nodes: NodeBitmap::empty(),
+            frames_seen: 0,
+            pending: None,
         }
     }
 
-    // Check auto-reply BEFORE forwarding.
-    let reply = if crc_ok {
-        auto_reply(frame, nodes).into_frame()
-    } else {
-        None
-    };
-
-    // Forward frames to core 0 via rx_slot.
-    // In normal mode: good-CRC only. In analyzer mode: all frames.
-    if (crc_ok || analyzer) && shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
-        let n = frame.len().min(MAX_FRAME_LEN);
-        let slot = unsafe { &mut *shared.rx_slot.get() };
-        slot.buf[..n].copy_from_slice(&frame[..n]);
-        slot.len = n as u16;
-        slot.status = if crc_ok { 0 } else { 1 };
-        compiler_fence(Ordering::SeqCst);
-        shared.flags.fetch_or(RX_READY, Ordering::Release);
+    /// Decode everything waiting in the RX ring.
+    fn service(&mut self, shared: &SharedState) {
+        while let Some(word) = try_read_rx() {
+            self.feed(word, shared);
+        }
+        self.expire_pending();
     }
 
-    // Auto-reply TX (immediate, no CSMA).
-    if let Some(reply_frame) = reply {
-        unsafe { AUTOREPLY_COUNT += 1; }
-        transmit_small_frame(&reply_frame);
+    fn feed(&mut self, word: u32, shared: &SharedState) {
+        if word == FRAME_END_MARKER {
+            // PIO detected idle after a frame. Force-complete any
+            // in-progress frame and reset for the next one.
+            if let Some(AsmEvent::FrameEnd) = self.assembler.feed_flag() {
+                self.frame_end(shared);
+                self.assembler.ack_frame_end();
+            }
+            self.unstuffer.reset();
+            self.assembler.feed_abort();
+            // The PIO pushes this ~1.75 cells after the last transition, so by
+            // now the sender has finished and let go of the line.
+            self.send_pending();
+            return;
+        }
+
+        mark_activity();
+        // Each word has 8 decoded FM-0 bits in [31:24].
+        let byte = ((word >> 24) & 0xFF) as u8;
+        for bit_idx in 0..8u32 {
+            let bit = (byte >> bit_idx) & 1;
+            match self.unstuffer.feed_bit(bit) {
+                UnstuffEvent::Byte(b) => {
+                    self.assembler.feed_byte(b);
+                }
+                UnstuffEvent::Flag => {
+                    if let Some(AsmEvent::FrameEnd) = self.assembler.feed_flag() {
+                        self.frame_end(shared);
+                        self.assembler.ack_frame_end();
+                    }
+                }
+                UnstuffEvent::Abort => {
+                    self.assembler.feed_abort();
+                    self.unstuffer.reset();
+                }
+                UnstuffEvent::None => {}
+            }
+        }
+    }
+
+    /// Process a completed frame: stats, echo suppression, auto-reply and
+    /// forwarding to the host.
+    fn frame_end(&mut self, shared: &SharedState) {
+        self.frames_seen = self.frames_seen.wrapping_add(1);
+        let frame = self.assembler.current();
+        let crc_ok = frame_crc_ok(frame);
+
+        let analyzer = crate::debug::ANALYZER_MODE.load(Ordering::Relaxed);
+
+        // Echo suppression: skip frames where src is one of our nodes.
+        // In analyzer mode, show everything including echoes.
+        let is_echo = frame.len() >= 2 && self.nodes.contains(frame[1]);
+        if is_echo && !analyzer {
+            unsafe { ECHO_SKIP_COUNT += 1; }
+            return;
+        }
+
+        // Count directed frames (Mac → us).
+        if frame.len() >= 1 && self.nodes.contains(frame[0]) {
+            unsafe { DIRECTED_RX_COUNT += 1; }
+        }
+
+        if crc_ok {
+            unsafe {
+                GOOD_CRC_COUNT += 1;
+                LAST_GOOD_LEN = frame.len() as u16;
+                let n = frame.len().min(8);
+                LAST_GOOD_FRAME = [0u8; 8];
+                LAST_GOOD_FRAME[..n].copy_from_slice(&frame[..n]);
+            }
+        } else {
+            unsafe {
+                BAD_CRC_COUNT += 1;
+                if frame.len() > 5 { BAD_REAL_COUNT += 1; }
+                LAST_BAD_LEN = frame.len() as u16;
+                let n = frame.len().min(8);
+                LAST_BAD_FRAME = [0u8; 8];
+                LAST_BAD_FRAME[..n].copy_from_slice(&frame[..n]);
+            }
+        }
+
+        let reply = if crc_ok {
+            auto_reply(frame, &self.nodes).into_frame()
+        } else {
+            None
+        };
+
+        // Forward frames to core 0. In normal mode: good-CRC only. In
+        // analyzer mode: all frames.
+        if crc_ok || analyzer {
+            push_rx(shared, frame, crc_ok);
+        }
+
+        // Encode it now while the sender is still on its abort sequence, so
+        // all we have left to do once the line goes quiet is start the DMA.
+        if let Some(reply_frame) = reply {
+            let (word_count, fm0_len) = build_small_frame_dma(&reply_frame);
+            self.pending = Some(PendingReply {
+                word_count,
+                fm0_len,
+                since: read_timer_us(),
+            });
+        }
+    }
+
+    fn send_pending(&mut self) {
+        let Some(p) = self.pending.take() else { return };
+        let waited = read_timer_us().wrapping_sub(p.since);
+        if waited > REPLY_WINDOW_US {
+            unsafe { AUTOREPLY_LATE += 1; }
+            return;
+        }
+        transmit_dma(unsafe { AUTOREPLY_DMA_BUF.as_ptr() }, p.word_count, p.fm0_len);
+        // Count our own reply as bus activity, so the silence a CSMA wait
+        // needs is measured from the end of it.
+        mark_activity();
+        unsafe {
+            AUTOREPLY_COUNT += 1;
+            AUTOREPLY_WAIT_MAX_US = AUTOREPLY_WAIT_MAX_US.max(waited as u32);
+        }
+    }
+
+    /// Drop the reply if its window closed before the line went quiet.
+    fn expire_pending(&mut self) {
+        let expired = match &self.pending {
+            Some(p) => read_timer_us().wrapping_sub(p.since) > REPLY_WINDOW_US,
+            None => false,
+        };
+        if expired {
+            self.pending = None;
+            unsafe { AUTOREPLY_LATE += 1; }
+        }
     }
 }
 
 // ── CSMA/CA helpers ───────────────────────────────────────────────
 
-/// Wait until carrier sense is inactive (bus idle). Blocks.
-/// Drains the RX ring to keep LAST_ACTIVITY_US current.
-fn wait_bus_idle() {
+/// Wait until carrier sense is inactive (bus idle), decoding and answering
+/// anything that arrives in the meantime. We give up after
+/// MAX_BUS_IDLE_WAIT_US and let the backoff sort it out, instead of leaving
+/// core 1 stuck here.
+fn wait_bus_idle(rx: &mut RxEngine, shared: &SharedState) {
+    let deadline = read_timer_us() + MAX_BUS_IDLE_WAIT_US;
     while carrier_sense_active() {
-        drain_rx_for_carrier_sense();
+        rx.service(shared);
+        if read_timer_us() >= deadline {
+            unsafe { BUS_IDLE_TIMEOUTS += 1; }
+            return;
+        }
     }
 }
 
-/// Wait for the bus to stay idle for `us` microseconds.
-/// Returns false if carrier sense fires during the wait (deferral).
-/// Drains the RX ring to keep LAST_ACTIVITY_US current.
-fn wait_idle_for(us: u64) -> bool {
+/// Wait for the bus to stay idle for `us` microseconds, decoding and
+/// answering anything that arrives in the meantime. Returns false if carrier
+/// sense fires or we end up owing a reply during the wait (deferral).
+fn wait_idle_for(us: u64, rx: &mut RxEngine, shared: &SharedState) -> bool {
     let deadline = read_timer_us() + us;
     while read_timer_us() < deadline {
-        drain_rx_for_carrier_sense();
-        if carrier_sense_active() {
+        rx.service(shared);
+        if carrier_sense_active() || rx.pending.is_some() {
             return false;
         }
     }
-    drain_rx_for_carrier_sense();
-    !carrier_sense_active()
-}
-
-/// Drain decoded bits from the RX ring to keep LAST_ACTIVITY_US
-/// current for carrier sense. With the PIO FM-0 decoder, any word
-/// in the ring (except frame-end marker) means bus activity.
-#[inline]
-fn drain_rx_for_carrier_sense() {
-    while let Some(word) = try_read_rx() {
-        if word != FRAME_END_MARKER {
-            mark_activity();
-        }
-    }
+    rx.service(shared);
+    !carrier_sense_active() && rx.pending.is_none()
 }
 
 /// CSMA/CA wait + transmit. Dispatches to directed (RTS/CTS/DATA)
 /// or broadcast path based on tx_slot.is_directed.
-fn csma_transmit(shared: &SharedState, backoff: &mut BackoffState) -> bool {
+fn csma_transmit(shared: &SharedState, backoff: &mut BackoffState, rx: &mut RxEngine) -> bool {
     // SAFETY: TX_SUBMIT was set, so core 0 is not writing tx_slot.
     let slot = unsafe { &*shared.tx_slot.get() };
 
     if slot.is_directed {
-        return directed_tx(shared, slot, backoff);
+        return directed_tx(shared, slot, backoff, rx);
     }
 
     // Broadcast / control frame — simple CSMA then TX.
@@ -647,13 +833,13 @@ fn csma_transmit(shared: &SharedState, backoff: &mut BackoffState) -> bool {
             return false;
         }
 
-        wait_bus_idle();
+        wait_bus_idle(rx, shared);
 
         let entropy = (read_timer_us() as u8)
             ^ ((read_timer_us() >> 8) as u8);
         let delay_units = backoff.next_backoff_units(entropy);
         let delay_us = delay_units as u64 * 100;
-        if !wait_idle_for(delay_us) {
+        if !wait_idle_for(delay_us, rx, shared) {
             backoff.record_deferral();
             backoff.consume_attempt();
             continue;
@@ -677,6 +863,7 @@ fn directed_tx(
     shared: &SharedState,
     slot: &TxSlot,
     backoff: &mut BackoffState,
+    rx: &mut RxEngine,
 ) -> bool {
     let our_src = slot.frame_src;
     let their_dest = slot.frame_dest;
@@ -690,13 +877,13 @@ fn directed_tx(
         }
 
         // ── CSMA wait ─────────────────────────────────────────────
-        wait_bus_idle();
+        wait_bus_idle(rx, shared);
 
         let entropy = (read_timer_us() as u8)
             ^ ((read_timer_us() >> 8) as u8);
         let delay_units = backoff.next_backoff_units(entropy);
         let delay_us = delay_units as u64 * 100;
-        if !wait_idle_for(delay_us) {
+        if !wait_idle_for(delay_us, rx, shared) {
             backoff.record_deferral();
             backoff.consume_attempt();
             continue;
@@ -709,28 +896,20 @@ fn directed_tx(
             slot.rts_fm0_len as usize,
         );
 
-        // ── Skip RTS echo ──────────────────────────────────────────
-        // Drain ring until we see the frame-end marker (PIO detected
-        // idle after our RTS echo) or timeout.
-        {
-            let echo_deadline = read_timer_us() + 500;
-            loop {
-                match try_read_rx() {
-                    Some(FRAME_END_MARKER) => break,
-                    Some(_) => {}
-                    None => {
-                        if read_timer_us() > echo_deadline { break; }
-                    }
-                }
-            }
-        }
-
         // ── Wait for CTS (tight polling loop) ─────────────────────
-        // 200 µs window for CTS to START arriving (per PIC reference).
-        // Once we see decoded data, extend the deadline to allow full
-        // frame reception + decode.
+        // Start listening as soon as the RTS is out. We don't wait for our
+        // own RTS echo first, because whether we hear the echo at all depends
+        // on how the transceiver is wired: with TX and RX tied to one pair we
+        // always hear it, but with them on separate pairs we never do, and
+        // waiting for it just runs out the clock while the peer's CTS comes
+        // and goes. An echoed RTS has dst = their_dest and src = our_src, so
+        // cts_matches_pending throws it away anyway.
+        //
+        // The CTS has CTS_START_WINDOW_US to START arriving. Once we see
+        // decoded data we extend the deadline so the whole frame can arrive
+        // and be decoded.
         let cts_wait_start = read_timer_us();
-        let mut cts_deadline = cts_wait_start + 200;
+        let mut cts_deadline = cts_wait_start + CTS_START_WINDOW_US;
         let mut saw_activity = false;
         let mut cts_unstuffer = BitUnstuffer::new();
         let mut cts_assembler = FrameAssembler::new();
@@ -752,15 +931,7 @@ fn directed_tx(
                         if frame_crc_ok(frame)
                             && cts_matches_pending(frame, our_src, their_dest)
                         {
-                            if shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
-                                let n = frame.len().min(MAX_FRAME_LEN);
-                                let rx = unsafe { &mut *shared.rx_slot.get() };
-                                rx.buf[..n].copy_from_slice(&frame[..n]);
-                                rx.len = n as u16;
-                                rx.status = 0;
-                                compiler_fence(Ordering::SeqCst);
-                                shared.flags.fetch_or(RX_READY, Ordering::Release);
-                            }
+                            push_rx(shared, frame, true);
                             got_cts = true;
                             unsafe { DIRECTED_TX_CTS_OK += 1; }
                         }
@@ -787,15 +958,7 @@ fn directed_tx(
                                     if frame_crc_ok(frame)
                                         && cts_matches_pending(frame, our_src, their_dest)
                                     {
-                                        if shared.flags.load(Ordering::Relaxed) & RX_READY == 0 {
-                                            let n = frame.len().min(MAX_FRAME_LEN);
-                                            let rx = unsafe { &mut *shared.rx_slot.get() };
-                                            rx.buf[..n].copy_from_slice(&frame[..n]);
-                                            rx.len = n as u16;
-                                            rx.status = 0;
-                                            compiler_fence(Ordering::SeqCst);
-                                            shared.flags.fetch_or(RX_READY, Ordering::Release);
-                                        }
+                                        push_rx(shared, frame, true);
                                         got_cts = true;
                                         unsafe { DIRECTED_TX_CTS_OK += 1; }
                                     }
@@ -853,11 +1016,8 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
     compiler_fence(Ordering::SeqCst);
 
     // Local state — entirely owned by core 1.
-    let mut unstuffer = BitUnstuffer::new();
-    let mut assembler = FrameAssembler::new();
+    let mut rx = RxEngine::new();
     let mut backoff = BackoffState::new();
-    let mut nodes = NodeBitmap::empty();
-    let mut frames_seen: u32 = 0;
 
     loop {
         unsafe { LOOP_COUNT = LOOP_COUNT.wrapping_add(1); }
@@ -867,62 +1027,25 @@ pub fn core1_main(shared: &'static SharedState) -> ! {
             compiler_fence(Ordering::SeqCst);
             // SAFETY: NODES_UPDATED set → core 0 finished writing.
             let bm = unsafe { &*shared.node_bitmap.get() };
-            nodes = NodeBitmap::from_bytes(*bm);
+            rx.nodes = NodeBitmap::from_bytes(*bm);
             shared.flags.fetch_and(!NODES_UPDATED, Ordering::Release);
         }
 
         // ── Poll PIO1 RX FIFO (hot path) ─────────────────────────
         match try_read_rx() {
-            Some(FRAME_END_MARKER) => {
-                // PIO detected idle after a frame. Force-complete any
-                // in-progress frame and reset for the next one.
-                // Synthetic flag triggers FrameEnd in the assembler.
-                if let Some(AsmEvent::FrameEnd) = assembler.feed_flag() {
-                    handle_frame_end(
-                        &assembler, &nodes, shared,
-                        &mut frames_seen,
-                    );
-                    assembler.ack_frame_end();
-                }
-                unstuffer.reset();
-                assembler.feed_abort(); // ensure clean state
-            }
-            Some(word) => {
-                mark_activity();
-                // Each word has 8 decoded FM-0 bits in [31:24].
-                // Feed them through the BitUnstuffer one at a time.
-                let byte = ((word >> 24) & 0xFF) as u8;
-                for bit_idx in 0..8u32 {
-                    let bit = (byte >> bit_idx) & 1;
-                    match unstuffer.feed_bit(bit) {
-                        UnstuffEvent::Byte(b) => {
-                            assembler.feed_byte(b);
-                        }
-                        UnstuffEvent::Flag => {
-                            if let Some(AsmEvent::FrameEnd) = assembler.feed_flag() {
-                                handle_frame_end(
-                                    &assembler, &nodes, shared,
-                                    &mut frames_seen,
-                                );
-                                assembler.ack_frame_end();
-                            }
-                        }
-                        UnstuffEvent::Abort => {
-                            assembler.feed_abort();
-                            unstuffer.reset();
-                        }
-                        UnstuffEvent::None => {}
-                    }
-                }
-            }
+            Some(word) => rx.feed(word, shared),
             None => {
+                rx.expire_pending();
                 // ── FIFO empty: check for host TX request ─────────
+                // Hold off while a reply is waiting for the line to go quiet.
+                // It goes out within REPLY_WINDOW_US at most, and a CSMA wait
+                // would just get deferred by it anyway.
                 let flags = shared.flags.load(Ordering::Relaxed);
-                if flags & TX_SUBMIT != 0 {
+                if flags & TX_SUBMIT != 0 && rx.pending.is_none() {
                     shared.flags.fetch_and(!TX_SUBMIT, Ordering::Acquire);
                     compiler_fence(Ordering::SeqCst);
 
-                    let ok = csma_transmit(shared, &mut backoff);
+                    let ok = csma_transmit(shared, &mut backoff, &mut rx);
 
                     // Signal completion to core 0.
                     let result_bits = TX_DONE | if ok { 0 } else { TX_RESULT_FAIL };
